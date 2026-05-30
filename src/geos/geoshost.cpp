@@ -1,7 +1,6 @@
 #define CPP_MODULE
 
 #include "dosbox.h"
-#include "control.h"
 #include "cpu/cpu.h"
 #include "hardware/input/mouse.h"
 #include "hardware/timer.h"
