@@ -19,8 +19,8 @@
 // Make sure ScalerMaxWidth remains a multiple of 8
 constexpr int ScalerWidthExtraPadding = 8 * 5;
 
-constexpr int ScalerMaxWidth  = 1600 + ScalerWidthExtraPadding;
-constexpr int ScalerMaxHeight = 1200;
+constexpr int ScalerMaxWidth  = 2548 + ScalerWidthExtraPadding;
+constexpr int ScalerMaxHeight = 2048;
 
 extern std::array<int, ScalerMaxHeight> scaler_changed_lines;
 extern int scaler_changed_line_index;

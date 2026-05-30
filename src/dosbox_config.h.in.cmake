@@ -104,6 +104,8 @@
 // Define to 1 to enable ALSA MIDI support
 #cmakedefine01 C_ALSA
 
+#define C_GEOSHOST	1
+
 
 // Defines for checking availability of standard functions and structs.
 //

@@ -960,7 +960,7 @@ static void reset_hardware()
 	// Resetting the wheel API status in reset() might seem to be a more
 	// logical approach, but this is clearly not what CuteMouse does;
 	// if this is done in reset(), the DN2 is unable to use mouse wheel
-	state.SetWheelApi(0);
+	state.SetWheelApi(true);
 	state.SetCounterWheel(0);
 
 	// Lower the IRQ line

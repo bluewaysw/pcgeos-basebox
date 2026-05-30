@@ -1112,6 +1112,11 @@ void DOSBOX_InitModuleConfigsAndMessages()
 	PROGRAMS_AddMessages();
 }
 
+#if C_GEOSHOST
+void GEOSHOST_Init();
+void GEOSHOST_Exit();
+#endif
+
 void DOSBOX_InitModules()
 {
 	DOSBOX_Init();
@@ -1164,10 +1169,17 @@ void DOSBOX_InitModules()
 	WEBSERVER_Init();
 
 	AUTOEXEC_Init();
+
+#if C_GEOSHOST
+	GEOSHOST_Init();
+#endif
 }
 
 void DOSBOX_DestroyModules()
 {
+#if C_GEOSHOST
+	GEOSHOST_Exit();
+#endif
 	WEBSERVER_Destroy();
 	VMWARE_Destroy();
 	VIRTUALBOX_Destroy();

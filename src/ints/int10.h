@@ -323,6 +323,10 @@ void INT10_Init();
 
 void INT10_SetupPalette();
 
+#if C_GEOSHOST
+uint8_t VESA_SetBaseboxMode(uint16_t width, uint16_t height);
+#endif
+
 std::optional<const VideoModeBlock> INT10_FindSvgaVideoMode(uint16_t mode);
 bool INT10_SetVideoMode(uint16_t mode);
 void INT10_SetCurMode(void);
