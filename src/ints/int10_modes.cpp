@@ -229,6 +229,10 @@ std::vector<VideoModeBlock> ModeList_VGA = {
 	{ 0x231,  M_TEXT, 1056,  480, 132, 30, 8, 16, 2, 0xB8000,  0x4000, 160,  611, 132,  480,                                  0},
 	{ 0x232,  M_TEXT, 1056,  476, 132, 34, 8, 14, 2, 0xB8000,  0x4000, 160,  622, 132,  476,                                  0},
 
+#if C_GEOSHOST
+	{ 0x89A, M_LIN16, 848,  480,  80, 30, 8, 16, 1, 0xA0000, 0x10000, 264,  525, 212,  480,                                  0},
+#endif
+
 	{0xFFFF, M_ERROR,    0,    0,   0,  0, 0,  0, 0, 0x00000,  0x0000,   0,    0,   0,    0,                                  0},
 };
 
@@ -863,7 +867,13 @@ static void finish_set_mode(bool clearmem) {
 		}
 	}
 	//  Setup the BIOS
-	if (CurMode->mode<128) real_writeb(BIOSMEM_SEG,BIOSMEM_CURRENT_MODE,(uint8_t)CurMode->mode);
+#if C_GEOSHOST
+	if (CurMode->mode == 0x89A) {
+		real_writeb(BIOSMEM_SEG, BIOSMEM_CURRENT_MODE, (uint8_t)127);
+	} else
+#endif
+	if (CurMode->mode < 128) \
+        real_writeb(BIOSMEM_SEG, BIOSMEM_CURRENT_MODE, (uint8_t)CurMode->mode);
 	else real_writeb(BIOSMEM_SEG,BIOSMEM_CURRENT_MODE,(uint8_t)(CurMode->mode-0x98));	//Looks like the s3 bios
 	real_writew(BIOSMEM_SEG,BIOSMEM_NB_COLS,(uint16_t)CurMode->twidth);
 	real_writew(BIOSMEM_SEG,BIOSMEM_PAGE_SIZE,(uint16_t)CurMode->plength);

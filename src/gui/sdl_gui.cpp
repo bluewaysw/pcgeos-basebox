@@ -47,6 +47,10 @@
 
 CHECK_NARROWING();
 
+#if C_GEOSHOST
+void GeosHost_NotifyVideoChange();
+#endif
+
 // #define DEBUG_WINDOW_EVENTS
 
 template <typename... Args>
@@ -609,6 +613,7 @@ static void setup_presentation_mode()
 
 static void notify_new_mouse_screen_params()
 {
+	LOG_INFO("notify_new_mouse_screen_params");
 	if (sdl.draw.draw_rect_px.w <= 0 || sdl.draw.draw_rect_px.h <= 0) {
 		// Filter out unusual parameters, which can be the result
 		// of window minimized due to ALT+TAB, for example
@@ -2422,7 +2427,11 @@ static bool handle_sdl_windowevent(const SDL_Event& event)
 		RENDER_SetScanAndPixelDoubling();
 		GFX_ResetScreen();
 
+#if C_GEOSHOST
+		GeosHost_NotifyVideoChange();
+#endif
 		notify_new_mouse_screen_params();
+
 		return true;
 	}
 

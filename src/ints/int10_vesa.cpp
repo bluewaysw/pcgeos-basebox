@@ -419,6 +419,51 @@ uint8_t VESA_GetSVGAModeInformation(uint16_t mode, uint16_t seg, uint16_t off)
 	return VESA_SUCCESS;
 }
 
+#if C_GEOSHOST
+uint8_t VESA_SetBaseboxMode(uint16_t width, uint16_t height)
+{
+#define MAX_SCREEN_WIDTH  2040
+#define MAX_SCREEN_HEIGHT 1536
+
+	if (width > MAX_SCREEN_WIDTH) {
+
+		height = (MAX_SCREEN_WIDTH * height) / width;
+		width  = MAX_SCREEN_WIDTH;
+	}
+
+	if (height > MAX_SCREEN_HEIGHT) {
+
+		width  = (MAX_SCREEN_HEIGHT * width) / height;
+		height = MAX_SCREEN_HEIGHT;
+	}
+
+	// force width to mulitple of 8
+	width = width & 0xFFF8;
+
+	// setup mode first
+	// Find the requested mode in our table of VGA modes
+	assert(ModeList_VGA.size());
+	for (auto& v : ModeList_VGA) {
+		if (v.mode == 0x89A) {
+			v.swidth   = width;
+			v.sheight  = height;
+			v.vtotal   = height + 50;
+			v.vdispend = height;
+			v.hdispend = width / 4;
+			LOG_INFO("found something %d %d", width, height);
+			break;
+		}
+	}
+
+	uint16_t mode = 0x89A;
+	if (INT10_SetVideoMode(mode)) {
+		int10.vesa_setmode = mode & 0x7fff;
+		return VESA_SUCCESS;
+	}
+	return VESA_FAIL;
+}
+#endif
+
 uint8_t VESA_SetSVGAMode(uint16_t mode)
 {
 	if (INT10_SetVideoMode(mode)) {

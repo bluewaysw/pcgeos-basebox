@@ -835,7 +835,7 @@ void SVGA_Setup_S3()
 	svga.accepts_mode           = &SVGA_S3_AcceptsMode;
 
 	if (vga.vmemsize == 0) {
-		vga.vmemsize = 4 * 1024 * 1024;
+		vga.vmemsize = 8 * 1024 * 1024;
 	}
 
 	// Set CRTC reg 36 to specify amount of VRAM and PCI

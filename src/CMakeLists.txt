@@ -20,6 +20,8 @@ add_subdirectory(shell)
 add_subdirectory(utils)
 add_subdirectory(webserver)
 
+add_subdirectory(geos)
+
 if (WIN32)
   add_subdirectory(platform/windows)
 endif()
