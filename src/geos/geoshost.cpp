@@ -1,55 +1,53 @@
-#define CPP_MODULE
+ï»¿#define CPP_MODULE
 
-#include "dosbox.h"
 #include "cpu/cpu.h"
+#include "dosbox.h"
+#include "gui/common.h"
 #include "hardware/input/mouse.h"
 #include "hardware/timer.h"
-#include "gui/common.h"
 
 #include "ints/int10.h"
 #include <SDL.h>
 
 #include "SDL3_net/SDL_net.h"
 
-#include "tlse.h"
 #include "tls_root_ca.h"
+#include "tlse.h"
 
 #if C_GEOSHOST
 
-#define USE_SDL3
+#define MAX_ASYNC_OP_SLOTS 16
 
-#define MAX_ASYNC_OP_SLOTS	16
+#define HIF_API_HOST   0
+#define HIF_API_VIDEO  1
+#define HIF_API_SSL    2
+#define HIF_API_SOCKET 3
 
-#define	HIF_API_HOST	0
-#define HIF_API_VIDEO	1
-#define HIF_API_SSL		2
-#define HIF_API_SOCKET	3
+#define HIF_SLOT_AX 0
+#define HIF_SLOT_SI 1
+#define HIF_SLOT_BX 2
+#define HIF_SLOT_CX 3
+#define HIF_SLOT_DX 4
+#define HIF_SLOT_DI 5
 
-#define HIF_SLOT_AX		0
-#define HIF_SLOT_SI		1
-#define HIF_SLOT_BX		2
-#define HIF_SLOT_CX		3
-#define HIF_SLOT_DX		4
-#define HIF_SLOT_DI		5
+#define HIF_NOTIFY_DISPLAY_SIZE_CHANGE 1
+#define HIF_NOTIFY_SOCKET_STATE_CHANGE 2
 
-	#define HIF_NOTIFY_DISPLAY_SIZE_CHANGE	1
-#define HIF_NOTIFY_SOCKET_STATE_CHANGE	2
-
-#define HIF_CHECK_API			98
-#define HIF_SET_VIDEO_PARAMS	4
+#define HIF_CHECK_API           98
+#define HIF_SET_VIDEO_PARAMS    4
 #define HIF_SET_EVENT_INTERRUPT 5
-#define HIF_EVENT_ASYNC_END		7
-#define HIF_GET_VIDEO_PARAMS	8
-#define HIF_GET_EVENT			9
+#define HIF_EVENT_ASYNC_END     7
+#define HIF_GET_VIDEO_PARAMS    8
+#define HIF_GET_EVENT           9
 
-#define HIF_OK					0
-#define HIF_NOT_FOUND			1
-#define HIF_NO_MEMORY			2
-#define HIF_ASYNC_OP			3
-#define HIF_TABLE_FULL			4
-#define HIF_PENDING				5
-#define HIF_EVENT_NOTIFICATION	6
-#define HIF_FAILED				7
+#define HIF_OK                 0
+#define HIF_NOT_FOUND          1
+#define HIF_NO_MEMORY          2
+#define HIF_ASYNC_OP           3
+#define HIF_TABLE_FULL         4
+#define HIF_PENDING            5
+#define HIF_EVENT_NOTIFICATION 6
+#define HIF_FAILED             7
 
 #define HIF_NETWORKING_BASE     1000
 #define HIF_NC_RESOLVE_ADDR     HIF_NETWORKING_BASE
@@ -62,9 +60,9 @@
 #define HIF_NC_CLOSE            HIF_NETWORKING_BASE + 7
 #define HIF_NC_DISCONNECT       HIF_NETWORKING_BASE + 8
 #define HIF_NC_CONNECTED        HIF_NETWORKING_BASE + 9
-#define HIF_NETWORKING_END     1199
+#define HIF_NETWORKING_END      1199
 
-#define HIF_SSL_BASE				 1200
+#define HIF_SSL_BASE                 1200
 #define HIF_SSL_V2_GET_CLIENT_METHOD HIF_SSL_BASE
 #define HIF_SSL_SSLEAY_ADD_SSL_ALGO  HIF_SSL_BASE + 1
 #define HIF_SSL_CTX_NEW              HIF_SSL_BASE + 2
@@ -81,11 +79,10 @@
 #define HIF_SSL_GET_SSL_METHOD       HIF_SSL_BASE + 13
 #define HIF_SSL_SET_CALLBACK         HIF_SSL_BASE + 14
 #define HIF_SSL_SET_TLSEXT_HOST_NAME HIF_SSL_BASE + 15
-#define HIF_SSL_SET_SSL_METHOD		 HIF_SSL_BASE + 16
+#define HIF_SSL_SET_SSL_METHOD       HIF_SSL_BASE + 16
 #define HIF_SSL_END                  1299
 
-
-const static char G_baseboxID[] = "XOBESAB2";
+const static char G_baseboxID[]  = "XOBESAB2";
 static uint8_t G_baseboxIDOffset = 1;
 
 static uint8_t G_commandOffset = 0;
@@ -93,10 +90,10 @@ static uint16_t G_commandBuffer[6];
 static uint8_t G_responseOffset = 0;
 static uint16_t G_responseBuffer[6];
 static uint8_t G_eventInterrupt = 0;
-SDL_mutex* G_eventQueueMutex = NULL;
-bool G_recheckEventInterrupt = false;
-bool G_protectedOpMode = false;
-static uint16_t G_nextAsyncID = 1;
+SDL_mutex* G_eventQueueMutex    = NULL;
+bool G_recheckEventInterrupt    = false;
+bool G_protectedOpMode          = false;
+static uint16_t G_nextAsyncID   = 1;
 
 static int G_lookupNext = 1;
 
@@ -106,25 +103,28 @@ private:
 	EventRecord* m_Next;
 
 public:
-	EventRecord(uint16_t* eventRecord, EventRecord* next) {
-		m_Next = next;
+	EventRecord(uint16_t* eventRecord, EventRecord* next)
+	{
+		m_Next            = next;
 		uint8_t loopCount = 0;
 		while (loopCount < 6) {
 			m_Payload[loopCount] = eventRecord[loopCount];
 			loopCount++;
 		}
 	}
-	~EventRecord() {
-	}
+	~EventRecord() {}
 
 public:
-	void SetNext(EventRecord* nextEvent) {
+	void SetNext(EventRecord* nextEvent)
+	{
 		m_Next = nextEvent;
 	};
-	EventRecord* GetNext() {
+	EventRecord* GetNext()
+	{
 		return m_Next;
 	}
-	void GetRecordData(uint16_t* recordBuf) {
+	void GetRecordData(uint16_t* recordBuf)
+	{
 
 		uint8_t loopCount = 0;
 		while (loopCount < 6) {
@@ -134,7 +134,7 @@ public:
 	}
 };
 
-#define UNALLOC_ASYNC_OP_ID	0
+#define UNALLOC_ASYNC_OP_ID 0
 
 class AsyncOp {
 private:
@@ -152,10 +152,10 @@ protected:
 public:
 	AsyncOp(AsyncOp* next)
 	{
-		m_Next = next;
-		m_Result[0] = HIF_PENDING;
-		m_thread    = NULL;
-		m_EventSent = false;
+		m_Next         = next;
+		m_Result[0]    = HIF_PENDING;
+		m_thread       = NULL;
+		m_EventSent    = false;
 		m_RunOwnThread = true;
 	}
 	virtual ~AsyncOp() {};
@@ -167,17 +167,17 @@ public:
 	{
 		return m_Next;
 	}
-	uint16_t GetID() {
+	uint16_t GetID()
+	{
 		return m_ID;
 	}
 	AsyncOp* Cleanup();
-
 
 public:
 	virtual uint16_t RunAsync()
 	{
 		return 0;
-	 };
+	};
 	virtual uint16_t PollStatus()
 	{
 		return 0;
@@ -185,19 +185,15 @@ public:
 	void HandleCompletion();
 };
 
-class AsyncSocketResolveAddr : public AsyncOp 
-{
+class AsyncSocketResolveAddr : public AsyncOp {
 private:
 	char m_hostname[256];
-#ifdef USE_SDL3
 	NET_Address* m_Addr;
-#endif
-public:
-	AsyncSocketResolveAddr(AsyncOp* next) : AsyncOp(next) {
-#ifdef USE_SDL3
-		m_Addr = NULL;
-#endif
 
+public:
+	AsyncSocketResolveAddr(AsyncOp* next) : AsyncOp(next)
+	{
+		m_Addr = NULL;
 	};
 	~AsyncSocketResolveAddr() {};
 
@@ -215,17 +211,15 @@ private:
 
 private:
 	uint16_t m_socketHandle;
-#ifdef USE_SDL3
 	NET_Address* m_Addr;
 	Uint16 m_Port;
 	State m_State;
-#endif
+
 public:
-	AsyncSocketConnect(AsyncOp* next) : AsyncOp(next) {
-#ifdef USE_SDL3
-		m_Addr = NULL;
+	AsyncSocketConnect(AsyncOp* next) : AsyncOp(next)
+	{
+		m_Addr  = NULL;
 		m_State = IDLE;
-#endif
 	};
 	~AsyncSocketConnect() {};
 
@@ -250,7 +244,7 @@ private:
 public:
 	AsyncSSLConnect(AsyncOp* next) : AsyncOp(next)
 	{
-		m_State = IDLE;
+		m_State        = IDLE;
 		m_socketHandle = 0;
 		m_ctx          = NULL;
 	};
@@ -266,7 +260,6 @@ public:
 
 class AsyncSSLWrite : public AsyncOp {
 private:
-
 private:
 	struct TLSContext* m_ctx;
 	int m_socketHandle;
@@ -288,7 +281,6 @@ public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
-
 
 class AsyncSSLRead : public AsyncOp {
 private:
@@ -320,9 +312,9 @@ public:
 class AsyncSocketSend : public AsyncOp {
 
 private:
-
 private:
 	uint16_t m_socketHandle;
+
 public:
 	AsyncSocketSend(AsyncOp* next) : AsyncOp(next) {};
 	~AsyncSocketSend() {};
@@ -339,10 +331,8 @@ struct SocketState {
 	volatile bool used;
 	volatile bool open;
 	volatile bool blocking;
-	//NET_StreamSocket socketSet;
-#ifdef USE_SDL3
+	// NET_StreamSocket socketSet;
 	NET_StreamSocket* stream;
-#endif
 	char* recvBuf;
 	volatile int recvBufUsed;
 	volatile bool receiveDone;
@@ -357,7 +347,7 @@ struct SocketState {
 	          recvBufUsed(0),
 	          receiveDone(false),
 	          sendDone(false),
-			  done(false),
+	          done(false),
 	          ssl(false),
 	          sslInitialEnd(false)
 	{}
@@ -368,16 +358,16 @@ static const int MaxSockets = 256;
 static SocketState NetSockets[MaxSockets];
 
 EventRecord* G_eventRecords = NULL;
-AsyncOp* G_opRecords = NULL;
+AsyncOp* G_opRecords        = NULL;
 
 void GeosHost_NotifySocketChange();
 
-static void PollSockets() {
+static void PollSockets()
+{
 
 	for (int i = 1; i < MaxSockets; i++) {
 		if (NetSockets[i].used && NetSockets[i].open &&
-		    !NetSockets[i].ssl &&
-		    !NetSockets[i].receiveDone &&
+		    !NetSockets[i].ssl && !NetSockets[i].receiveDone &&
 		    !NetSockets[i].done && (NetSockets[i].recvBufUsed <= 0)) {
 			if (NetSockets[i].recvBuf == NULL) {
 				LOG_MSG("\nReceived new buf");
@@ -389,7 +379,7 @@ static void PollSockets() {
 			                                      8192);
 			if (result < 0) {
 				// handle error situation
-				NetSockets[i].receiveDone = true;
+				NetSockets[i].receiveDone   = true;
 				NetSockets[i].sslInitialEnd = true;
 				GeosHost_NotifySocketChange();
 			} else if (result > 0) {
@@ -398,7 +388,8 @@ static void PollSockets() {
 
 				//				SDL_mutexP(G_callbackMutex);
 				//				G_callbackPending
-				//= true; 				SDL_mutexV(G_callbackMutex);
+				//= true;
+				//SDL_mutexV(G_callbackMutex);
 				// PIC_ActivateIRQ(5);
 				GeosHost_NotifySocketChange();
 
@@ -408,25 +399,23 @@ static void PollSockets() {
 	}
 }
 
-static void GeosHost_TickHandler(void) {
+static void GeosHost_TickHandler(void)
+{
 
 	// Check for AsyncOp completion
 	AsyncOp* nextOp = G_opRecords;
 	while (nextOp) {
-	
-        nextOp->PollStatus();
+
+		nextOp->PollStatus();
 		nextOp->HandleCompletion();
 		nextOp = nextOp->GetNext();
 	}
 	if (G_opRecords) {
 		G_opRecords = G_opRecords->Cleanup();
 	}
-#ifdef USE_SDL3
-	if (G_protectedOpMode == cpu.pmode)
-	{
+	if (G_protectedOpMode == cpu.pmode) {
 		PollSockets();
 	}
-#endif
 
 	// if in the matching operation mode: real mode or protected mode
 	if (G_eventInterrupt && (G_protectedOpMode == cpu.pmode)) {
@@ -445,18 +434,20 @@ static void GeosHost_TickHandler(void) {
 			         thisIntCount);
 
 			CPU_SW_Interrupt(G_eventInterrupt, reg_eip);
-			//DOSBOX_RunMachine();
+			// DOSBOX_RunMachine();
 			LOG_INFO("GEOSHOST: Event interrupt done (#%d)", thisIntCount);
-		} 
+		}
 	}
 }
 
-void GeosHost_GeneralNotification() {
+void GeosHost_GeneralNotification()
+{
 
 	// Send general notification event
 }
 
-void GeosHost_AsyncCompletion() {
+void GeosHost_AsyncCompletion()
+{
 
 	// Send async completion event
 }
@@ -465,7 +456,7 @@ void GeosHost_SendEvent(uint16_t* eventRecord)
 {
 	// Create Event Object
 	EventRecord* newRecord = new EventRecord(eventRecord, NULL);
-	
+
 	// Add Event to list
 	SDL_mutexP(G_eventQueueMutex);
 	if (G_eventRecords == NULL) {
@@ -476,7 +467,8 @@ void GeosHost_SendEvent(uint16_t* eventRecord)
 	SDL_mutexV(G_eventQueueMutex);
 }
 
-uint16_t AsyncSocketSend::Init(uint16_t* cmdRec) {
+uint16_t AsyncSocketSend::Init(uint16_t* cmdRec)
+{
 
 	m_socketHandle = cmdRec[1];
 
@@ -497,30 +489,27 @@ uint16_t AsyncSocketSend::Init(uint16_t* cmdRec) {
 		char* buffer = new char[size + 1];
 
 		if (G_protectedOpMode) {
-			Descriptor desc;	
+			Descriptor desc;
 			cpu.gdt.GetDescriptor(G_commandBuffer[2], desc);
 
-			uint32_t dosBuff = static_cast<uint32_t>(
-		                                   desc.GetBase()) +
-		                           G_commandBuffer[3];
-		    for (int i = 0; i < size; i++) {
+			uint32_t dosBuff = static_cast<uint32_t>(desc.GetBase()) +
+			                   G_commandBuffer[3];
+			for (int i = 0; i < size; i++) {
 				buffer[i] = mem_readb(dosBuff + i);
 			}
 
 		} else {
 
 			uint32_t dosBuff = static_cast<uint32_t>(
-		                                   G_commandBuffer[2] << 4) +
-		                           G_commandBuffer[3];
-		    for (int i = 0; i < size; i++) {
+			                           G_commandBuffer[2] << 4) +
+			                   G_commandBuffer[3];
+			for (int i = 0; i < size; i++) {
 				buffer[i] = mem_readb(dosBuff + i);
 			}
 		}
 		buffer[size] = 0;
 
-		bool result = NET_WriteToStreamSocket(sock.stream,
-		                                      buffer,
-		                                      size);
+		bool result = NET_WriteToStreamSocket(sock.stream, buffer, size);
 		delete[] buffer;
 		if (!result) {
 			return HIF_FAILED;
@@ -529,16 +518,18 @@ uint16_t AsyncSocketSend::Init(uint16_t* cmdRec) {
 	return HIF_OK;
 }
 
-uint16_t AsyncSocketSend::RunAsync() {
+uint16_t AsyncSocketSend::RunAsync()
+{
 	return 0;
 }
 
-uint16_t AsyncSocketSend::PollStatus() {
+uint16_t AsyncSocketSend::PollStatus()
+{
 	SocketState& sock = NetSockets[m_socketHandle];
 	if (sock.stream) {
 		int pendingCount = NET_GetStreamSocketPendingWrites(sock.stream);
 		if (pendingCount == 0) {
-		
+
 			// successfully sent
 			m_Result[0] = HIF_OK;
 		} else {
@@ -549,7 +540,6 @@ uint16_t AsyncSocketSend::PollStatus() {
 	return 0;
 }
 
-
 uint16_t AsyncSocketResolveAddr::Init(uint16_t* cmdRec)
 {
 	// si:bx	= host name address
@@ -559,37 +549,33 @@ uint16_t AsyncSocketResolveAddr::Init(uint16_t* cmdRec)
 	if (G_protectedOpMode) {
 		Descriptor desc;
 		cpu.gdt.GetDescriptor(cmdRec[1], desc);
-		MEM_StrCopy(static_cast<uint32_t>(desc.GetBase()) +
-		                    cmdRec[2],
+		MEM_StrCopy(static_cast<uint32_t>(desc.GetBase()) + cmdRec[2],
 		            m_hostname,
 		            cmdRec[3]); // 1024 toasts the
 		                        // stack
 	} else {
-		MEM_StrCopy(static_cast<uint32_t>(
-		                      cmdRec[1] << 4) +
-		                    cmdRec[2],
+		MEM_StrCopy(static_cast<uint32_t>(cmdRec[1] << 4) + cmdRec[2],
 		            m_hostname,
 		            cmdRec[3]); // 1024 toasts the
 		                        // stack
 	}
-	
+
 	m_hostname[cmdRec[3]] = 0;
 
-#ifdef USE_SDL3
 	m_RunOwnThread = false;
-	m_Addr = NET_ResolveHostname(m_hostname);
+	m_Addr         = NET_ResolveHostname(m_hostname);
 	if (m_Addr == NULL) {
 		return HIF_FAILED;
 	}
-#endif
+
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t 
-AsyncSocketConnect::Init(uint16_t* cmdRec) {
+uint16_t AsyncSocketConnect::Init(uint16_t* cmdRec)
+{
 
 	m_socketHandle = cmdRec[4];
-#ifdef USE_SDL3
+
 	m_RunOwnThread = false;
 	char hostname[20];
 	sprintf(hostname,
@@ -600,27 +586,28 @@ AsyncSocketConnect::Init(uint16_t* cmdRec) {
 	        (cmdRec[1] >> 8) & 0xFF);
 	LOG_MSG("\nAsyncSocketConnect::Init: %s\n", hostname);
 	m_Port = cmdRec[3] /* ((cmdRec[3] & 0xFF) << 8) |
-	         ((cmdRec[3] >> 8) & 0xFF)*/;
+	         ((cmdRec[3] >> 8) & 0xFF)*/
+	        ;
 	m_Addr = NET_ResolveHostname(hostname);
 	if (m_Addr == NULL) {
 		return HIF_FAILED;
 	}
 	m_State = RESOLVING;
-#endif
+
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t 
-AsyncSocketConnect::RunAsync() {
+uint16_t AsyncSocketConnect::RunAsync()
+{
 
 	return 0;
 }
 
-
-uint16_t AsyncSocketConnect::PollStatus() {
+uint16_t AsyncSocketConnect::PollStatus()
+{
 
 	switch (m_State) {
-	case RESOLVING: 
+	case RESOLVING:
 		if (m_Addr) {
 			NET_Status status = NET_GetAddressStatus(m_Addr);
 			if (status != NET_WAITING) {
@@ -628,39 +615,38 @@ uint16_t AsyncSocketConnect::PollStatus() {
 					m_State = CONNECTING;
 
 					// move on to connecint state
-					NetSockets[m_socketHandle].stream = NET_CreateClient(m_Addr, m_Port);
+					NetSockets[m_socketHandle].stream =
+					        NET_CreateClient(m_Addr, m_Port);
 				} else {
 					// failed
 					m_State     = DONE;
 					m_Result[0] = HIF_FAILED;
 				}
-			NET_UnrefAddress(m_Addr);
+				NET_UnrefAddress(m_Addr);
 			}
 		}
 		break;
 	case CONNECTING:
 		if (NetSockets[m_socketHandle].stream) {
-			NET_Status status = NET_GetConnectionStatus(NetSockets[m_socketHandle].stream);
+			NET_Status status = NET_GetConnectionStatus(
+			        NetSockets[m_socketHandle].stream);
 			if (status != NET_WAITING) {
 				if (status == NET_SUCCESS) {
 					m_State = CONNECTED;
-					//NetSockets[m_socketHandle].open = true;
+					// NetSockets[m_socketHandle].open = true;
 					LOG_MSG("NetConnectRequest success");
 					m_Result[0] = HIF_OK;
 					m_State     = DONE;
-				} 
-				else {
+				} else {
 					m_Result[0] = HIF_FAILED;
 					m_State     = DONE;
 				}
 			}
 		}
-	default: 
-		break;
+	default: break;
 	}
 	return 0;
 }
-
 
 static int InitOpThread(void* paramsPtr)
 {
@@ -668,19 +654,18 @@ static int InitOpThread(void* paramsPtr)
 	return 0;
 }
 
-uint16_t 
-AsyncOp::Init(uint16_t* cmdRec)
+uint16_t AsyncOp::Init(uint16_t* cmdRec)
 {
 	// allocate ID
-	m_ID        = G_nextAsyncID;
+	m_ID = G_nextAsyncID;
 	G_nextAsyncID++;
 
 	uint16_t checkSlot = 0;
 	while (checkSlot < MAX_ASYNC_OP_SLOTS) {
 
-		AsyncOp *nextOp = G_opRecords;
+		AsyncOp* nextOp = G_opRecords;
 		while (nextOp) {
-		
+
 			if (nextOp->GetID() == checkSlot) {
 				break;
 			}
@@ -696,7 +681,7 @@ AsyncOp::Init(uint16_t* cmdRec)
 	}
 
 	if (checkSlot == MAX_ASYNC_OP_SLOTS) {
-	
+
 		// error, all slots full
 		return HIF_FAILED;
 	}
@@ -717,11 +702,10 @@ AsyncOp::Init(uint16_t* cmdRec)
 	return HIF_PENDING | (m_ID << 8);
 }
 
-void 
-AsyncOp::HandleCompletion() 
+void AsyncOp::HandleCompletion()
 {
 	if (!m_EventSent && m_Result[0] != HIF_PENDING) {
-	
+
 		m_Result[0] |= m_ID << 8;
 		GeosHost_SendEvent(m_Result);
 
@@ -731,11 +715,11 @@ AsyncOp::HandleCompletion()
 
 AsyncOp* AsyncOp::Cleanup()
 {
-	
+
 	AsyncOp* nextOp = this->GetNext();
-	AsyncOp* thisOp = this; 
+	AsyncOp* thisOp = this;
 	while (nextOp) {
-	
+
 		nextOp = nextOp->GetNext();
 		if (nextOp->m_EventSent) {
 			AsyncOp* deleteOp = nextOp;
@@ -759,35 +743,33 @@ AsyncOp* AsyncOp::Cleanup()
 	return this;
 }
 
-uint16_t
-AsyncSocketResolveAddr::RunAsync()
+uint16_t AsyncSocketResolveAddr::RunAsync()
 {
 	m_Result[0] = HIF_FAILED;
 
 	return 0;
 }
 
-#ifdef USE_SDL3
-uint16_t 
-AsyncSocketResolveAddr::PollStatus() {
+uint16_t AsyncSocketResolveAddr::PollStatus()
+{
 
 	NET_Status status = NET_GetAddressStatus(m_Addr);
 	if (m_Addr && (status != NET_WAITING)) {
 		if (status == NET_SUCCESS) {
-			m_Result[0] = HIF_OK;
-			long addr_host   = NET_GetIP4Address(m_Addr);
+			m_Result[0]    = HIF_OK;
+			long addr_host = NET_GetIP4Address(m_Addr);
 			LOG_MSG("NetResolveAddr success %x", addr_host);
-			m_Result[1] = ((addr_host >> 16) & 0xFF) | ((addr_host >> 16) & 0xFF00);
+			m_Result[1] = ((addr_host >> 16) & 0xFF) |
+			              ((addr_host >> 16) & 0xFF00);
 			m_Result[2] = (addr_host & 0xFF) | (addr_host & 0xFF00);
 		} else {
-			m_Result[0] = HIF_FAILED;		
+			m_Result[0] = HIF_FAILED;
 		}
 		NET_UnrefAddress(m_Addr);
 		m_Addr = NULL;
 	}
 	return 0;
 }
-#endif
 
 static uint16_t read_baseboxid(io_port_t, io_width_t)
 {
@@ -842,10 +824,7 @@ static int AllocHandle(void* ptr)
 	return 0;
 }
 
-uint16_t 
-AsyncSSLConnect::RunAsync() {
-
-}
+uint16_t AsyncSSLConnect::RunAsync() {}
 
 int validate_certificate(struct TLSContext* context,
                          struct TLSCertificate** certificate_chain, int len)
@@ -878,10 +857,9 @@ int validate_certificate(struct TLSContext* context,
 		}
 	}
 
-    //err = tls_certificate_chain_is_valid_root(context, certificate_chain, len);
-	//if (err) {
-	//	return err;
-	//}
+	// err = tls_certificate_chain_is_valid_root(context, certificate_chain,
+	// len); if (err) { 	return err;
+	// }
 
 	fprintf(stderr, "Certificate OK\n");
 
@@ -890,7 +868,6 @@ int validate_certificate(struct TLSContext* context,
 	// return certificate_unknown;
 	return no_error;
 }
-
 
 uint16_t AsyncSSLConnect::Init(uint16_t* cmdRec)
 {
@@ -923,11 +900,11 @@ uint16_t AsyncSSLConnect::Init(uint16_t* cmdRec)
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t 
-AsyncSSLConnect::PollStatus() {
+uint16_t AsyncSSLConnect::PollStatus()
+{
 	SocketState& sock = NetSockets[m_socketHandle];
 	switch (m_State) {
-	
+
 	case SENDING:
 		if (sock.stream) {
 			int pendingCount = NET_GetStreamSocketPendingWrites(
@@ -938,13 +915,11 @@ AsyncSSLConnect::PollStatus() {
 				tls_buffer_clear(m_ctx);
 
 				if (tls_established(m_ctx) == 1) {
-				
-					m_Result[0] = HIF_OK;
+
+					m_Result[0]           = HIF_OK;
 					m_Result[HIF_SLOT_DX] = 1;
 					m_State               = DONE;
-				} 
-				else
-				{
+				} else {
 					m_State = RECEIVING;
 				}
 
@@ -958,58 +933,51 @@ AsyncSSLConnect::PollStatus() {
 		int result = NET_ReadFromStreamSocket(sock.stream,
 		                                      m_Buffer,
 		                                      sizeof(m_Buffer));
-			if (result < 0) {
-				// handle error situation
-				sock.receiveDone   = true;
-				sock.sslInitialEnd = true;
-				GeosHost_NotifySocketChange();
+		if (result < 0) {
+			// handle error situation
+			sock.receiveDone   = true;
+			sock.sslInitialEnd = true;
+			GeosHost_NotifySocketChange();
 
-				m_Result[0] = HIF_FAILED;
-				m_State     = DONE;
+			m_Result[0] = HIF_FAILED;
+			m_State     = DONE;
 
-			} else if (result > 0) {
+		} else if (result > 0) {
 
-				// some data to consume
-			        tls_consume_stream(m_ctx,
-			                           m_Buffer,
-			                           result,
-			                           validate_certificate);
+			// some data to consume
+			tls_consume_stream(m_ctx, m_Buffer, result, validate_certificate);
 
-				// restart sending
-				if (tls_established(m_ctx) == 1) {
+			// restart sending
+			if (tls_established(m_ctx) == 1) {
 
-					m_Result[0] = HIF_OK;
-				    m_Result[HIF_SLOT_DX] = 1;
-					m_State     = DONE;
-				} 
-				else {
-				    unsigned int out_buffer_len;
-				    const unsigned char* out_buffer =
-				            tls_get_write_buffer(m_ctx,
-				                                    &out_buffer_len);
+				m_Result[0]           = HIF_OK;
+				m_Result[HIF_SLOT_DX] = 1;
+				m_State               = DONE;
+			} else {
+				unsigned int out_buffer_len;
+				const unsigned char* out_buffer =
+				        tls_get_write_buffer(m_ctx, &out_buffer_len);
 
-				    if (out_buffer) {
-					    m_State = SENDING;
-					    bool result = NET_WriteToStreamSocket(
-					            NetSockets[m_socketHandle]
-					                    .stream,
-					            out_buffer,
-					            out_buffer_len);
-					    if (!result) {
-						    return HIF_FAILED;
-					    }
-				    }
-			    }
-		     }
+				if (out_buffer) {
+					m_State     = SENDING;
+					bool result = NET_WriteToStreamSocket(
+					        NetSockets[m_socketHandle].stream,
+					        out_buffer,
+					        out_buffer_len);
+					if (!result) {
+						return HIF_FAILED;
+					}
+				}
+			}
 		}
-		break;
+	} break;
 	}
 
 	return 0;
 }
 
-uint16_t 
-AsyncSSLWrite::Init(uint16_t* cmdRec) {
+uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
+{
 
 	m_RunOwnThread = false;
 
@@ -1019,16 +987,16 @@ AsyncSSLWrite::Init(uint16_t* cmdRec) {
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatdSocket[handle - 1];
 
-	//uint32_t dosBuff = static_cast<uint32_t>(G_commandBuffer[4] << 4) +
-	//                   G_commandBuffer[3];
+	// uint32_t dosBuff = static_cast<uint32_t>(G_commandBuffer[4] << 4) +
+	//                    G_commandBuffer[3];
 	int size = cmdRec[5];
 	LOG_MSG("NetSendData data size: %d", size);
 
 	char* buffer = new char[size + 1];
-	//for (int i = 0; i < size; i++) {
+	// for (int i = 0; i < size; i++) {
 	//	buffer[i] = mem_readb(dosBuff + i);
-	//}
-	//buffer[size] = 0;
+	// }
+	// buffer[size] = 0;
 
 	if (G_protectedOpMode) {
 		Descriptor desc;
@@ -1050,10 +1018,10 @@ AsyncSSLWrite::Init(uint16_t* cmdRec) {
 	}
 	buffer[size] = 0;
 
-    m_written = tls_write(m_ctx, (const unsigned char*) buffer, (unsigned int) size);
+	m_written = tls_write(m_ctx, (const unsigned char*)buffer, (unsigned int)size);
 	if (m_written < 0) {
-	    return HIF_FAILED;
-    }
+		return HIF_FAILED;
+	}
 
 	unsigned int out_buffer_len;
 	const unsigned char* out_buffer = tls_get_write_buffer(m_ctx, &out_buffer_len);
@@ -1068,24 +1036,20 @@ AsyncSSLWrite::Init(uint16_t* cmdRec) {
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t 
-AsyncSSLWrite::RunAsync() {
+uint16_t AsyncSSLWrite::RunAsync() {}
 
-}
-
-uint16_t 
-AsyncSSLWrite::PollStatus() {
+uint16_t AsyncSSLWrite::PollStatus()
+{
 
 	SocketState& sock = NetSockets[m_socketHandle];
 	if (sock.stream) {
-		int pendingCount = NET_GetStreamSocketPendingWrites(
-			    sock.stream);
+		int pendingCount = NET_GetStreamSocketPendingWrites(sock.stream);
 		if (pendingCount == 0) {
 
 			// successfully sent
 			tls_buffer_clear(m_ctx);
 
-			m_Result[0] = HIF_OK;
+			m_Result[0]           = HIF_OK;
 			m_Result[HIF_SLOT_DX] = m_written;
 
 		} else if (pendingCount < 0) {
@@ -1096,29 +1060,27 @@ AsyncSSLWrite::PollStatus() {
 	return 0;
 }
 
-
 uint16_t AsyncSSLRead::Init(uint16_t* cmdRec)
 {
 
 	m_RunOwnThread = false;
 
 	int handle = G_commandBuffer[HIF_SLOT_SI];
-	//LOG_MSG("!!!AsyncSSLRead::Init %x", handle);
+	// LOG_MSG("!!!AsyncSSLRead::Init %x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatdSocket[handle - 1];
-	//LOG_MSG("!!!AsyncSSLRead::Init socketHandle %x", m_socketHandle);
+	// LOG_MSG("!!!AsyncSSLRead::Init socketHandle %x", m_socketHandle);
 
-	m_BufferSegment  = G_commandBuffer[4];
-	m_BufferOffset   = G_commandBuffer[3];
-	m_BufferSize     = cmdRec[5];
-	//LOG_MSG("!!!AsyncSSLRead::Init bufferSize %d", m_BufferSize);
+	m_BufferSegment = G_commandBuffer[4];
+	m_BufferOffset  = G_commandBuffer[3];
+	m_BufferSize    = cmdRec[5];
+	// LOG_MSG("!!!AsyncSSLRead::Init bufferSize %d", m_BufferSize);
 
 	return AsyncOp::Init(cmdRec);
 }
 
 uint16_t AsyncSSLRead::RunAsync() {}
-
 
 bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 {
@@ -1127,12 +1089,12 @@ bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 		return false;
 	}
 
-	// Real Mode oder VM86: keine Deskriptor-Prüfung nötig
+	// Real Mode oder VM86: keine Deskriptor-Prï¿½fung nï¿½tig
 	if (!cpu.pmode || (reg_flags & FLAG_VM)) {
 		return true;
 	}
 
-	// LDT-Selektor: prüfen ob LDT überhaupt geladen ist
+	// LDT-Selektor: prï¿½fen ob LDT ï¿½berhaupt geladen ist
 	if (selector & 4) {
 		if ((cpu.gdt.SLDT() & 0xFFFC) == 0) {
 			return false;
@@ -1144,7 +1106,7 @@ bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 		return false;
 	}
 
-	// Present-Bit prüfen
+	// Present-Bit prï¿½fen
 	if (!desc.saved.seg.p) {
 		return false;
 	}
@@ -1156,7 +1118,7 @@ bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 		return false;
 	}
 
-	// Typ-Prüfung
+	// Typ-Prï¿½fung
 	uint8_t type = desc.Type();
 	if (isWrite) {
 		// Muss beschreibbares Datensegment sein
@@ -1177,14 +1139,13 @@ uint16_t AsyncSSLRead::PollStatus()
 {
 	if (G_protectedOpMode) {
 		if (!cpu.pmode) {
-		
+
 			return 0;
 		}
 		if (!IsSegmentAccessible(m_BufferSegment, true)) {
 			return 0;
 		}
-	} 
-	else if (cpu.pmode) {
+	} else if (cpu.pmode) {
 		return 0;
 	}
 
@@ -1212,13 +1173,11 @@ uint16_t AsyncSSLRead::PollStatus()
 		} else {
 
 			for (int i2 = 0; i2 < read_size; i2++) {
-				mem_writeb(static_cast<uint32_t>(
-							m_BufferSegment << 4) +
+				mem_writeb(static_cast<uint32_t>(m_BufferSegment << 4) +
 				                   m_BufferOffset + i2,
 				           m_Buffer[i2]);
 			}
 		}
-
 
 	} else {
 		SocketState& sock = NetSockets[m_socketHandle];
@@ -1253,7 +1212,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 {
 	// we receive command bytes on this io port, works like a
 	// interrupt but keeps the overall processor state
-	// 
+	//
 	// parameters are fetched from register contents as needed
 	// result are fed into registers as well, depending on the command
 	// potentially referenced memory is read or written
@@ -1271,7 +1230,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				VESA_SetBaseboxMode(newWidth, newHeight);
 				LOG_INFO("GEOSHOST:Set basebox video mode");
 				MOUSEDOS_AfterNewVideoMode(false);
-				
+
 				G_responseBuffer[0] = HIF_OK;
 				G_responseBuffer[2] = 0x89A;
 				G_responseOffset    = 6;
@@ -1294,25 +1253,21 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				G_responseBuffer[4] = (((uint16_t)G_baseboxID[7])
 				                       << 8) |
 				                      G_baseboxID[6];
-				/* Return API specific version, 0 if API is not supported */
+				/* Return API specific version, 0 if API is not
+				 * supported */
 				switch (G_commandBuffer[1]) {
-					case HIF_API_HOST: 
-						resultVersion = 1;
-						break;
-					case HIF_API_VIDEO:
-						resultVersion = 1;
-						break;
-				    case HIF_API_SOCKET:
-					    resultVersion = 2;
-					    break;
-				    case HIF_API_SSL:
-						resultVersion = 1;
-						break;
-				    default: 
-						resultVersion = 0; /* any other unsupported API: not supported */
+				case HIF_API_HOST: resultVersion = 1; break;
+				case HIF_API_VIDEO: resultVersion = 1; break;
+				case HIF_API_SOCKET: resultVersion = 2; break;
+				case HIF_API_SSL: resultVersion = 1; break;
+				default:
+					resultVersion = 0; /* any other
+					                      unsupported API:
+					                      not supported */
 				}
-				G_responseBuffer[5] = resultVersion; /* minor (compatibility)
-				                            version */
+				G_responseBuffer[5] = resultVersion; /* minor
+				                            (compatibility) version
+				                          */
 				G_responseOffset = 6;
 
 			} else if (G_commandBuffer[0] == HIF_SET_EVENT_INTERRUPT) {
@@ -1323,25 +1278,30 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 				float ddpi, hdpi, vdpi;
 
-				int displayIndex = SDL_GetWindowDisplayIndex(GFX_GetWindow());
+				int displayIndex = SDL_GetWindowDisplayIndex(
+				        GFX_GetWindow());
 
 				int width, height;
 				SDL_GL_GetDrawableSize(GFX_GetWindow(), &width, &height);
 
 				G_responseBuffer[0] = HIF_OK;
-				//G_responseBuffer[1] = sdl.draw_rect_px.w; /* native width */
-				//G_responseBuffer[2] = sdl.draw_rect_px.h; /* native height */
-				G_responseBuffer[1] = width; /* native width */ 
+				// G_responseBuffer[1] = sdl.draw_rect_px.w; /*
+				// native width */ G_responseBuffer[2] =
+				// sdl.draw_rect_px.h; /* native height */
+				G_responseBuffer[1] = width;  /* native width */
 				G_responseBuffer[2] = height; /* native height */
 
 				// Get the DPI of the first display (index 0)
 				if (SDL_GetDisplayDPI(displayIndex, &ddpi, &hdpi, &vdpi) ==
 				    0) {
-					G_responseBuffer[3] = hdpi; /* horizontal dpi */
-					G_responseBuffer[4] = vdpi; /* vertical dpi */
+					G_responseBuffer[3] = hdpi; /* horizontal
+					                               dpi */
+					G_responseBuffer[4] = vdpi; /* vertical
+					                               dpi */
 				} else {
 					/* error getting the dpi */
-					G_responseBuffer[3] = 0; /* horizontal dpi */
+					G_responseBuffer[3] = 0; /* horizontal
+					                            dpi */
 					G_responseBuffer[4] = 0; /* vertical dpi */
 				}
 				LOG_MSG("GEOSHOST: Current host window resolution (x,y,dpi_x,dpi_y): %d, %d, %d, %d",
@@ -1351,9 +1311,9 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				        G_responseBuffer[4]);
 				G_responseBuffer[5] = 0; /* unused */
 				G_responseOffset    = 6;
-			
+
 			} else if (G_commandBuffer[0] == HIF_GET_EVENT) {
-			
+
 				// Add Event to list
 				SDL_mutexP(G_eventQueueMutex);
 				if (G_eventRecords == NULL) {
@@ -1389,9 +1349,9 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 					}
 				} else {
 
-					G_responseBuffer[0] = HIF_NO_MEMORY;			
+					G_responseBuffer[0] = HIF_NO_MEMORY;
 				}
-				G_responseOffset    = 6;
+				G_responseOffset = 6;
 
 			} else if (G_commandBuffer[0] == HIF_NC_ALLOC_CONNECTION) {
 
@@ -1518,8 +1478,10 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 								}
 								G_responseOffset = 6;
 
-								if (NetSockets[i].sendDone ) {
-									NetSockets[i].used = false;
+								if (NetSockets[i]
+								            .sendDone) {
+									NetSockets[i]
+									        .used = false;
 								}
 
 								return;
@@ -1548,7 +1510,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 								// return size;
 								G_responseBuffer[1] =
 								        NetSockets[i]
-								                 .recvBufUsed;
+								                .recvBufUsed;
 								G_responseBuffer[2] = i;
 								break;
 							}
@@ -1603,7 +1565,8 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 									     i2 < size;
 									     i2++) {
 										mem_writeb(
-										        static_cast<uint32_t>(desc.GetBase()) +
+										        static_cast<uint32_t>(
+										                desc.GetBase()) +
 										                G_commandBuffer[3] +
 										                i2,
 										        NetSockets[i]
@@ -1646,12 +1609,11 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				SocketState& sock = NetSockets[G_commandBuffer[1]];
 
 				if (sock.used) {
-					//sock.done = true;
+					// sock.done = true;
 					sock.sendDone = true;
 					if (sock.stream) {
-						NET_DestroyStreamSocket(
-						        sock.stream);						
-						sock.stream  = NULL;
+						NET_DestroyStreamSocket(sock.stream);
+						sock.stream      = NULL;
 						sock.receiveDone = true;
 						sock.done        = false;
 					}
@@ -1684,17 +1646,18 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				int handle = AllocHandle(
 				        tls_create_context(method, TLS_V12));
 
-				//SSL_set_io(reinterpret_cast<struct TLSContext*>(
-				//                   handles[handle - 1]),
-				//           (void*)SSLSocketRecv,
-				//           (void*)SSLSocketSend);
+				// SSL_set_io(reinterpret_cast<struct
+				// TLSContext*>(
+				//                    handles[handle - 1]),
+				//            (void*)SSLSocketRecv,
+				//            (void*)SSLSocketSend);
 
-				//reg_ax = handle & 0xFFFF;
-				//reg_dx = (handle >> 16) & 0xFFFF;
+				// reg_ax = handle & 0xFFFF;
+				// reg_dx = (handle >> 16) & 0xFFFF;
 				LOG_MSG("!!!SSLContextNew context %x", handle);
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = handle & 0xFFFF;
-				G_responseOffset    = 6;
+				G_responseOffset              = 6;
 
 			} else if (G_commandBuffer[0] == HIF_SSL_NEW) {
 
@@ -1702,33 +1665,33 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 				int handle = G_commandBuffer[HIF_SLOT_SI];
 
-				struct TLSContext* context = reinterpret_cast<struct TLSContext*>(
-				        handles[handle - 1]);
+				struct TLSContext* context =
+				        reinterpret_cast<struct TLSContext*>(
+				                handles[handle - 1]);
 
 				LOG_MSG("!!!SSLNew context %d, %x", handle, context);
 
-				int method    = 0; // client method
-				struct TLSContext *context2 = tls_create_context(method,
-				                                        TLS_V12); 
-				//tls_load_root_certificates(context2,
-				//                          (const unsigned char*) ROOT_CA_DEF,
-				//                          ROOT_CA_DEF_LEN);
-				//SSL_CTX_root_ca(context2, "D:\\cacert.pem");
+				int method = 0; // client method
+				struct TLSContext* context2 =
+				        tls_create_context(method, TLS_V12);
+				// tls_load_root_certificates(context2,
+				//                           (const unsigned
+				//                           char*) ROOT_CA_DEF,
+				//                           ROOT_CA_DEF_LEN);
+				// SSL_CTX_root_ca(context2, "D:\\cacert.pem");
 
 				int newHandle = AllocHandle(context2);
 
 				LOG_MSG("!!!SSLNew result %d", newHandle);
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = newHandle & 0xFFFF;
-				G_responseOffset              = 6;
-			} 
-			else if (G_commandBuffer[0] == HIF_SSL_SET_SSL_METHOD) {
-				
+				G_responseOffset = 6;
+			} else if (G_commandBuffer[0] == HIF_SSL_SET_SSL_METHOD) {
+
 				G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
 				G_responseBuffer[HIF_SLOT_DX] = 0;
-				G_responseOffset = 6;
-			} 
-			else if (G_commandBuffer[0] == HIF_SSL_SET_FD) {
+				G_responseOffset              = 6;
+			} else if (G_commandBuffer[0] == HIF_SSL_SET_FD) {
 
 				int handle = G_commandBuffer[HIF_SLOT_SI];
 				LOG_MSG("!!!SSLSetFD %x", handle);
@@ -1743,13 +1706,12 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				G_responseBuffer[HIF_SLOT_DX] = 0;
 				G_responseOffset              = 6;
 				LOG_MSG("!!!SSLSetFD done");
-			} 
-			else if (G_commandBuffer[0] == HIF_SSL_SET_TLSEXT_HOST_NAME) {
+			} else if (G_commandBuffer[0] == HIF_SSL_SET_TLSEXT_HOST_NAME) {
 
 				char host[256];
 				LOG_MSG("!!!HIF_SSL_SET_TLSEXT_HOST_NAME");
 
-				int handle  = G_commandBuffer[HIF_SLOT_SI];
+				int handle = G_commandBuffer[HIF_SLOT_SI];
 				LOG_MSG("!!!SSLSetTLSEXT_HOST_NAME %x", handle);
 
 				struct TLSContext* ctx =
@@ -1776,8 +1738,8 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 				int result = tls_sni_set(ctx, host);
 
-				//reg_ax = result & 0xFFFF;
-				//reg_dx = (result >> 16) & 0xFFFF;
+				// reg_ax = result & 0xFFFF;
+				// reg_dx = (result >> 16) & 0xFFFF;
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = 0;
 
@@ -1855,31 +1817,31 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 					G_responseBuffer[0] = HIF_NO_MEMORY;
 				}
 				G_responseOffset = 6;
-			}
-			else if (G_commandBuffer[0] == HIF_SSL_CTX_FREE)
-			{
+			} else if (G_commandBuffer[0] == HIF_SSL_CTX_FREE) {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
-				tls_destroy_context((struct TLSContext *) handles[handle - 1]);
+				tls_destroy_context(
+				        (struct TLSContext*)handles[handle - 1]);
 				handles[handle - 1] = NULL;
 
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 			} else if (G_commandBuffer[0] == HIF_SSL_FREE) {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
-				
-				tls_destroy_context((struct TLSContext *) handles[handle - 1]);
+
+				tls_destroy_context(
+				        (struct TLSContext*)handles[handle - 1]);
 				handles[handle - 1] = NULL;
 
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-			} else
-			{
-			LOG_INFO("GEOSHOST: Unhandled request code: %d",
-						G_commandBuffer[0]);			
+			} else {
+				LOG_INFO("GEOSHOST: Unhandled request code: %d",
+				         G_commandBuffer[0]);
 			}
 		}
 	}
 }
 
-void GEOSHOST_Init() {
+void GEOSHOST_Init()
+{
 
 	NET_Init();
 
@@ -1893,12 +1855,10 @@ void GEOSHOST_Init() {
 	LOG_INFO("GEOSHOST:Initialized");
 }
 
-void GEOSHOST_Exit() {
+void GEOSHOST_Exit()
+{
 
 	NET_Quit();
 }
 
 #endif // C_GEOSHOST
-
-
-
