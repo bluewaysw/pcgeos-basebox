@@ -643,6 +643,7 @@ uint16_t AsyncSocketConnect::PollStatus()
 				}
 			}
 		}
+		break;
 	default: break;
 	}
 	return 0;
@@ -715,30 +716,25 @@ void AsyncOp::HandleCompletion()
 
 AsyncOp* AsyncOp::Cleanup()
 {
-
-	AsyncOp* nextOp = this->GetNext();
-	AsyncOp* thisOp = this;
-	while (nextOp) {
-
-		nextOp = nextOp->GetNext();
-		if (nextOp->m_EventSent) {
-			AsyncOp* deleteOp = nextOp;
-			thisOp->m_Next    = nextOp->GetNext();
-			delete deleteOp;
-		}
-		thisOp = GetNext();
-		if (thisOp) {
-			nextOp = thisOp->GetNext();
+	// Remove completed ops from the tail of the list
+	AsyncOp* prev = this;
+	AsyncOp* curr = this->GetNext();
+	while (curr) {
+		if (curr->m_EventSent) {
+			prev->m_Next = curr->GetNext();
+			delete curr;
+			curr = prev->m_Next;
 		} else {
-			nextOp = NULL;
+			prev = curr;
+			curr = curr->GetNext();
 		}
 	}
 
-	m_Next = nextOp;
-
+	// If head itself is complete, remove it
 	if (this->m_EventSent) {
+		AsyncOp* newHead = this->GetNext();
 		delete this;
-		return nextOp;
+		return newHead;
 	}
 	return this;
 }
@@ -805,7 +801,7 @@ void GeosHost_NotifySocketChange()
 #define MAX_HANDLES 20
 
 static void* handles[MAX_HANDLES];
-static uint16_t associatdSocket[MAX_HANDLES];
+static uint16_t associatedSocket[MAX_HANDLES];
 
 static int AllocHandle(void* ptr)
 {
@@ -824,7 +820,10 @@ static int AllocHandle(void* ptr)
 	return 0;
 }
 
-uint16_t AsyncSSLConnect::RunAsync() {}
+uint16_t AsyncSSLConnect::RunAsync()
+{
+	return 0;
+}
 
 int validate_certificate(struct TLSContext* context,
                          struct TLSCertificate** certificate_chain, int len)
@@ -878,7 +877,7 @@ uint16_t AsyncSSLConnect::Init(uint16_t* cmdRec)
 	LOG_MSG("!!!AsyncSSLConnect::Init %x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
-	m_socketHandle = associatdSocket[handle - 1];
+	m_socketHandle = associatedSocket[handle - 1];
 
 	int res = tls_client_connect(m_ctx);
 	if (res < 0) {
@@ -985,7 +984,7 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 	LOG_MSG("!!!AsyncSSLConnect::Init %x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
-	m_socketHandle = associatdSocket[handle - 1];
+	m_socketHandle = associatedSocket[handle - 1];
 
 	// uint32_t dosBuff = static_cast<uint32_t>(G_commandBuffer[4] << 4) +
 	//                    G_commandBuffer[3];
@@ -1036,7 +1035,10 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t AsyncSSLWrite::RunAsync() {}
+uint16_t AsyncSSLWrite::RunAsync()
+{
+	return 0;
+}
 
 uint16_t AsyncSSLWrite::PollStatus()
 {
@@ -1069,7 +1071,7 @@ uint16_t AsyncSSLRead::Init(uint16_t* cmdRec)
 	// LOG_MSG("!!!AsyncSSLRead::Init %x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
-	m_socketHandle = associatdSocket[handle - 1];
+	m_socketHandle = associatedSocket[handle - 1];
 	// LOG_MSG("!!!AsyncSSLRead::Init socketHandle %x", m_socketHandle);
 
 	m_BufferSegment = G_commandBuffer[4];
@@ -1080,7 +1082,10 @@ uint16_t AsyncSSLRead::Init(uint16_t* cmdRec)
 	return AsyncOp::Init(cmdRec);
 }
 
-uint16_t AsyncSSLRead::RunAsync() {}
+uint16_t AsyncSSLRead::RunAsync()
+{
+	return 0;
+}
 
 bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 {
@@ -1454,7 +1459,6 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				}
 				G_responseOffset = 6;
 
-				G_responseOffset = 6;
 			} else if (G_commandBuffer[0] == HIF_NC_RECV_NEXT_CLOSE) {
 
 				G_responseBuffer[0] = HIF_OK;
@@ -1698,7 +1702,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 				int socket = G_commandBuffer[HIF_SLOT_DI];
 				LOG_MSG("!!!SSLSetFD socket %x", socket);
-				associatdSocket[handle - 1] = socket;
+				associatedSocket[handle - 1] = socket;
 
 				NetSockets[socket].ssl = true;
 
