@@ -16,6 +16,14 @@
 
 #if C_GEOSHOST
 
+#define GEOSHOST_DEBUG 0
+
+#if GEOSHOST_DEBUG
+#define GH_DBG(fmt, ...) LOG_MSG("GEOSHOST: " fmt, ##__VA_ARGS__)
+#else
+#define GH_DBG(fmt, ...) ((void)0)
+#endif
+
 #define MAX_ASYNC_OP_SLOTS 16
 
 #define HIF_API_HOST   0
@@ -103,34 +111,22 @@ private:
 	EventRecord* m_Next;
 
 public:
-	EventRecord(uint16_t* eventRecord, EventRecord* next)
+	EventRecord(uint16_t* eventRecord, EventRecord* next) : m_Next(next)
 	{
-		m_Next            = next;
-		uint8_t loopCount = 0;
-		while (loopCount < 6) {
-			m_Payload[loopCount] = eventRecord[loopCount];
-			loopCount++;
-		}
+		memcpy((void*)m_Payload, eventRecord, sizeof(m_Payload));
 	}
-	~EventRecord() {}
 
-public:
 	void SetNext(EventRecord* nextEvent)
 	{
 		m_Next = nextEvent;
-	};
+	}
 	EventRecord* GetNext()
 	{
 		return m_Next;
 	}
 	void GetRecordData(uint16_t* recordBuf)
 	{
-
-		uint8_t loopCount = 0;
-		while (loopCount < 6) {
-			recordBuf[loopCount] = m_Payload[loopCount];
-			loopCount++;
-		}
+		memcpy(recordBuf, (const void*)m_Payload, sizeof(m_Payload));
 	}
 };
 
@@ -145,8 +141,6 @@ private:
 
 protected:
 	bool m_RunOwnThread;
-
-protected:
 	uint16_t m_Result[6];
 
 public:
@@ -160,9 +154,7 @@ public:
 	}
 	virtual ~AsyncOp() {};
 
-public:
 	virtual uint16_t Init(uint16_t* cmdRec);
-
 	AsyncOp* GetNext()
 	{
 		return m_Next;
@@ -173,7 +165,6 @@ public:
 	}
 	AsyncOp* Cleanup();
 
-public:
 	virtual uint16_t RunAsync()
 	{
 		return 0;
@@ -197,10 +188,7 @@ public:
 	};
 	~AsyncSocketResolveAddr() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
@@ -208,8 +196,6 @@ public:
 class AsyncSocketConnect : public AsyncOp {
 private:
 	enum State { IDLE, RESOLVING, CONNECTING, CONNECTED, DONE };
-
-private:
 	uint16_t m_socketHandle;
 	NET_Address* m_Addr;
 	Uint16 m_Port;
@@ -223,10 +209,7 @@ public:
 	};
 	~AsyncSocketConnect() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
@@ -234,8 +217,6 @@ public:
 class AsyncSSLConnect : public AsyncOp {
 private:
 	enum State { IDLE, SENDING, RECEIVING, DONE };
-
-private:
 	State m_State;
 	struct TLSContext* m_ctx;
 	int m_socketHandle;
@@ -250,16 +231,12 @@ public:
 	};
 	~AsyncSSLConnect() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
 
 class AsyncSSLWrite : public AsyncOp {
-private:
 private:
 	struct TLSContext* m_ctx;
 	int m_socketHandle;
@@ -274,21 +251,16 @@ public:
 	};
 	~AsyncSSLWrite() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
 
 class AsyncSSLRead : public AsyncOp {
 private:
-private:
 	struct TLSContext* m_ctx;
 	int m_socketHandle;
 	uint8_t m_Buffer[8192];
-
 	uint16_t m_BufferSegment;
 	uint16_t m_BufferOffset;
 	uint16_t m_BufferSize;
@@ -301,17 +273,12 @@ public:
 	};
 	~AsyncSSLRead() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
 
 class AsyncSocketSend : public AsyncOp {
-
-private:
 private:
 	uint16_t m_socketHandle;
 
@@ -319,10 +286,7 @@ public:
 	AsyncSocketSend(AsyncOp* next) : AsyncOp(next) {};
 	~AsyncSocketSend() {};
 
-public:
 	uint16_t Init(uint16_t* cmdRec);
-
-public:
 	uint16_t RunAsync();
 	uint16_t PollStatus();
 };
@@ -399,7 +363,7 @@ static void PollSockets()
 		    !NetSockets[i].ssl && !NetSockets[i].receiveDone &&
 		    !NetSockets[i].done && (NetSockets[i].recvBufUsed <= 0)) {
 			if (NetSockets[i].recvBuf == NULL) {
-				LOG_MSG("\nReceived new buf");
+				GH_DBG("Socket %d: allocating recv buffer", i);
 				NetSockets[i].recvBuf = new char[8192];
 			}
 
@@ -407,22 +371,14 @@ static void PollSockets()
 			                                      NetSockets[i].recvBuf,
 			                                      8192);
 			if (result < 0) {
-				// handle error situation
+				LOG_WARNING("GEOSHOST: Socket %d recv error", i);
 				NetSockets[i].receiveDone   = true;
 				NetSockets[i].sslInitialEnd = true;
 				GeosHost_NotifySocketChange();
 			} else if (result > 0) {
 				NetSockets[i].recvBufUsed = result;
-				LOG_MSG("\nSet sock->recvBufUsed %d", result);
-
-				//				SDL_mutexP(G_callbackMutex);
-				//				G_callbackPending
-				//= true;
-				//SDL_mutexV(G_callbackMutex);
-				// PIC_ActivateIRQ(5);
+				GH_DBG("Socket %d: received %d bytes", i, result);
 				GeosHost_NotifySocketChange();
-
-				LOG_MSG("\nReceived data passed");
 			}
 		}
 	}
@@ -459,26 +415,12 @@ static void GeosHost_TickHandler(void)
 			// issue software interrupt
 			int thisIntCount = intCounter++;
 
-			LOG_INFO("GEOSHOST: Trigger event interrupt (#%d)",
-			         thisIntCount);
+			GH_DBG("Trigger event interrupt (#%d)", thisIntCount);
 
 			CPU_SW_Interrupt(G_eventInterrupt, reg_eip);
-			// DOSBOX_RunMachine();
-			LOG_INFO("GEOSHOST: Event interrupt done (#%d)", thisIntCount);
+			GH_DBG("Event interrupt done (#%d)", thisIntCount);
 		}
 	}
-}
-
-void GeosHost_GeneralNotification()
-{
-
-	// Send general notification event
-}
-
-void GeosHost_AsyncCompletion()
-{
-
-	// Send async completion event
 }
 
 void GeosHost_SendEvent(uint16_t* eventRecord)
@@ -501,19 +443,20 @@ uint16_t AsyncSocketSend::Init(uint16_t* cmdRec)
 
 	m_socketHandle = cmdRec[1];
 
-	LOG_MSG("AsyncSocketSend::Init: %d %x:%x %d",
-	        cmdRec[4],
-	        cmdRec[2],
-	        cmdRec[3],
-	        m_socketHandle);
+	GH_DBG("SocketSend::Init: size=%d seg:off=%x:%x socket=%d",
+	       cmdRec[4],
+	       cmdRec[2],
+	       cmdRec[3],
+	       m_socketHandle);
 
 	if (m_socketHandle < 0 || m_socketHandle >= MaxSockets) {
+		LOG_WARNING("GEOSHOST: SocketSend: invalid handle %d", m_socketHandle);
 		return HIF_FAILED;
 	} else {
 		SocketState& sock = NetSockets[m_socketHandle];
 
 		int size = cmdRec[4];
-		LOG_MSG("NetSendData data size: %d", size);
+		GH_DBG("SocketSend: data size=%d", size);
 
 		char* buffer = new char[size + 1];
 
@@ -523,6 +466,8 @@ uint16_t AsyncSocketSend::Init(uint16_t* cmdRec)
 		bool result = NET_WriteToStreamSocket(sock.stream, buffer, size);
 		delete[] buffer;
 		if (!result) {
+			LOG_WARNING("GEOSHOST: SocketSend: write failed on socket %d",
+			            m_socketHandle);
 			return HIF_FAILED;
 		}
 	}
@@ -555,7 +500,7 @@ uint16_t AsyncSocketResolveAddr::Init(uint16_t* cmdRec)
 {
 	// si:bx	= host name address
 	// cx = address name len
-	LOG_MSG("\nAsyncSocketResolveAddr::Init: %x %x\n", cmdRec[1], cmdRec[2]);
+	GH_DBG("ResolveAddr::Init: seg=%x off=%x", cmdRec[1], cmdRec[2]);
 
 	MEM_StrCopy(ResolveAddress(cmdRec[1], cmdRec[2]), m_hostname, cmdRec[3]);
 	m_hostname[cmdRec[3]] = 0;
@@ -563,6 +508,7 @@ uint16_t AsyncSocketResolveAddr::Init(uint16_t* cmdRec)
 	m_RunOwnThread = false;
 	m_Addr         = NET_ResolveHostname(m_hostname);
 	if (m_Addr == NULL) {
+		LOG_WARNING("GEOSHOST: Failed to resolve hostname: %s", m_hostname);
 		return HIF_FAILED;
 	}
 
@@ -582,12 +528,13 @@ uint16_t AsyncSocketConnect::Init(uint16_t* cmdRec)
 	        (cmdRec[2] >> 8) & 0xFF,
 	        cmdRec[1] & 0xFF,
 	        (cmdRec[1] >> 8) & 0xFF);
-	LOG_MSG("\nAsyncSocketConnect::Init: %s\n", hostname);
+	LOG_INFO("GEOSHOST: Connect to %s:%d (socket %d)", hostname, m_Port, m_socketHandle);
 	m_Port = cmdRec[3] /* ((cmdRec[3] & 0xFF) << 8) |
 	         ((cmdRec[3] >> 8) & 0xFF)*/
 	        ;
 	m_Addr = NET_ResolveHostname(hostname);
 	if (m_Addr == NULL) {
+		LOG_WARNING("GEOSHOST: Failed to resolve: %s", hostname);
 		return HIF_FAILED;
 	}
 	m_State = RESOLVING;
@@ -611,12 +558,11 @@ uint16_t AsyncSocketConnect::PollStatus()
 			if (status != NET_WAITING) {
 				if (status == NET_SUCCESS) {
 					m_State = CONNECTING;
-
-					// move on to connecint state
 					NetSockets[m_socketHandle].stream =
 					        NET_CreateClient(m_Addr, m_Port);
 				} else {
-					// failed
+					LOG_WARNING("GEOSHOST: Address resolution failed for socket %d",
+					            m_socketHandle);
 					m_State     = DONE;
 					m_Result[0] = HIF_FAILED;
 				}
@@ -631,11 +577,13 @@ uint16_t AsyncSocketConnect::PollStatus()
 			if (status != NET_WAITING) {
 				if (status == NET_SUCCESS) {
 					m_State = CONNECTED;
-					// NetSockets[m_socketHandle].open = true;
-					LOG_MSG("NetConnectRequest success");
+					LOG_INFO("GEOSHOST: Socket %d connected",
+					         m_socketHandle);
 					m_Result[0] = HIF_OK;
 					m_State     = DONE;
 				} else {
+					LOG_WARNING("GEOSHOST: Socket %d connection failed",
+					            m_socketHandle);
 					m_Result[0] = HIF_FAILED;
 					m_State     = DONE;
 				}
@@ -680,8 +628,8 @@ uint16_t AsyncOp::Init(uint16_t* cmdRec)
 	}
 
 	if (checkSlot == MAX_ASYNC_OP_SLOTS) {
-
-		// error, all slots full
+		LOG_WARNING("GEOSHOST: All %d async op slots full",
+		            MAX_ASYNC_OP_SLOTS);
 		return HIF_FAILED;
 	}
 
@@ -692,7 +640,8 @@ uint16_t AsyncOp::Init(uint16_t* cmdRec)
 		m_thread = SDL_CreateThread(InitOpThread, "InitOpThread", (void*)this);
 
 		if (NULL == m_thread) {
-			LOG_MSG("\nSDL_CreateThread failed: %s\n", SDL_GetError());
+			LOG_WARNING("GEOSHOST: SDL_CreateThread failed: %s",
+			            SDL_GetError());
 			return HIF_NO_MEMORY;
 		}
 		SDL_DetachThread(m_thread);
@@ -752,7 +701,7 @@ uint16_t AsyncSocketResolveAddr::PollStatus()
 		if (status == NET_SUCCESS) {
 			m_Result[0]    = HIF_OK;
 			long addr_host = NET_GetIP4Address(m_Addr);
-			LOG_MSG("NetResolveAddr success %x", addr_host);
+			LOG_INFO("GEOSHOST: Address resolved: %x", addr_host);
 			m_Result[1] = ((addr_host >> 16) & 0xFF) |
 			              ((addr_host >> 16) & 0xFF00);
 			m_Result[2] = (addr_host & 0xFF) | (addr_host & 0xFF00);
@@ -815,6 +764,7 @@ static int AllocHandle(void* ptr)
 		handle++;
 	}
 
+	LOG_WARNING("GEOSHOST: Handle table full (%d slots)", MAX_HANDLES);
 	return 0;
 }
 
@@ -858,7 +808,7 @@ int validate_certificate(struct TLSContext* context,
 	// len); if (err) { 	return err;
 	// }
 
-	fprintf(stderr, "Certificate OK\n");
+	GH_DBG("Certificate validation OK");
 
 	// return certificate_expired;
 	// return certificate_revoked;
@@ -872,13 +822,14 @@ uint16_t AsyncSSLConnect::Init(uint16_t* cmdRec)
 	m_RunOwnThread = false;
 
 	int handle = G_commandBuffer[HIF_SLOT_SI];
-	LOG_MSG("!!!AsyncSSLConnect::Init %x", handle);
+	GH_DBG("SSLConnect::Init handle=%x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatedSocket[handle - 1];
 
 	int res = tls_client_connect(m_ctx);
 	if (res < 0) {
+		LOG_WARNING("GEOSHOST: tls_client_connect failed: %d", res);
 		return HIF_FAILED;
 	}
 
@@ -889,6 +840,8 @@ uint16_t AsyncSSLConnect::Init(uint16_t* cmdRec)
 	                                      out_buffer,
 	                                      out_buffer_len);
 	if (!result) {
+		LOG_WARNING("GEOSHOST: SSLConnect initial write failed on socket %d",
+		            m_socketHandle);
 		return HIF_FAILED;
 	}
 
@@ -908,11 +861,12 @@ uint16_t AsyncSSLConnect::PollStatus()
 			        sock.stream);
 			if (pendingCount == 0) {
 
-				// successfully sent
 				tls_buffer_clear(m_ctx);
 
 				if (tls_established(m_ctx) == 1) {
 
+					LOG_INFO("GEOSHOST: TLS handshake complete (socket %d)",
+					         m_socketHandle);
 					m_Result[0]           = HIF_OK;
 					m_Result[HIF_SLOT_DX] = 1;
 					m_State               = DONE;
@@ -921,6 +875,8 @@ uint16_t AsyncSSLConnect::PollStatus()
 				}
 
 			} else if (pendingCount < 0) {
+				LOG_WARNING("GEOSHOST: TLS handshake write error (socket %d)",
+				            m_socketHandle);
 				m_Result[0] = HIF_FAILED;
 				m_State     = DONE;
 			}
@@ -931,7 +887,8 @@ uint16_t AsyncSSLConnect::PollStatus()
 		                                      m_Buffer,
 		                                      sizeof(m_Buffer));
 		if (result < 0) {
-			// handle error situation
+			LOG_WARNING("GEOSHOST: TLS handshake recv error (socket %d)",
+			            m_socketHandle);
 			sock.receiveDone   = true;
 			sock.sslInitialEnd = true;
 			GeosHost_NotifySocketChange();
@@ -941,12 +898,12 @@ uint16_t AsyncSSLConnect::PollStatus()
 
 		} else if (result > 0) {
 
-			// some data to consume
 			tls_consume_stream(m_ctx, m_Buffer, result, validate_certificate);
 
-			// restart sending
 			if (tls_established(m_ctx) == 1) {
 
+				LOG_INFO("GEOSHOST: TLS handshake complete (socket %d)",
+				         m_socketHandle);
 				m_Result[0]           = HIF_OK;
 				m_Result[HIF_SLOT_DX] = 1;
 				m_State               = DONE;
@@ -962,6 +919,8 @@ uint16_t AsyncSSLConnect::PollStatus()
 					        out_buffer,
 					        out_buffer_len);
 					if (!result) {
+						LOG_WARNING("GEOSHOST: TLS handshake write failed (socket %d)",
+						            m_socketHandle);
 						return HIF_FAILED;
 					}
 				}
@@ -979,13 +938,13 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 	m_RunOwnThread = false;
 
 	int handle = G_commandBuffer[HIF_SLOT_SI];
-	LOG_MSG("!!!AsyncSSLConnect::Init %x", handle);
+	GH_DBG("SSLWrite::Init handle=%x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatedSocket[handle - 1];
 
 	int size = cmdRec[5];
-	LOG_MSG("NetSendData data size: %d", size);
+	GH_DBG("SSLWrite: data size=%d", size);
 
 	char* buffer = new char[size + 1];
 
@@ -994,6 +953,7 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 
 	m_written = tls_write(m_ctx, (const unsigned char*)buffer, (unsigned int)size);
 	if (m_written < 0) {
+		LOG_WARNING("GEOSHOST: tls_write failed: %d", m_written);
 		return HIF_FAILED;
 	}
 
@@ -1004,6 +964,8 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 	                                      out_buffer,
 	                                      out_buffer_len);
 	if (!result) {
+		LOG_WARNING("GEOSHOST: SSLWrite stream write failed on socket %d",
+		            m_socketHandle);
 		return HIF_FAILED;
 	}
 
@@ -1030,6 +992,8 @@ uint16_t AsyncSSLWrite::PollStatus()
 			m_Result[HIF_SLOT_DX] = m_written;
 
 		} else if (pendingCount < 0) {
+			LOG_WARNING("GEOSHOST: SSLWrite pending error on socket %d",
+			            m_socketHandle);
 			m_Result[0] = HIF_FAILED;
 		}
 	}
@@ -1043,16 +1007,16 @@ uint16_t AsyncSSLRead::Init(uint16_t* cmdRec)
 	m_RunOwnThread = false;
 
 	int handle = G_commandBuffer[HIF_SLOT_SI];
-	// LOG_MSG("!!!AsyncSSLRead::Init %x", handle);
+	GH_DBG("SSLRead::Init handle=%x", handle);
 
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatedSocket[handle - 1];
-	// LOG_MSG("!!!AsyncSSLRead::Init socketHandle %x", m_socketHandle);
+	GH_DBG("SSLRead::Init socket=%x", m_socketHandle);
 
 	m_BufferSegment = G_commandBuffer[4];
 	m_BufferOffset  = G_commandBuffer[3];
 	m_BufferSize    = cmdRec[5];
-	// LOG_MSG("!!!AsyncSSLRead::Init bufferSize %d", m_BufferSize);
+	GH_DBG("SSLRead::Init bufferSize=%d", m_BufferSize);
 
 	return AsyncOp::Init(cmdRec);
 }
@@ -1149,7 +1113,8 @@ uint16_t AsyncSSLRead::PollStatus()
 			                                      m_Buffer,
 			                                      sizeof(m_Buffer));
 			if (result < 0) {
-				// handle error situation
+				LOG_WARNING("GEOSHOST: SSLRead recv error on socket %d",
+				            m_socketHandle);
 				sock.receiveDone   = true;
 				sock.sslInitialEnd = true;
 				GeosHost_NotifySocketChange();
@@ -1182,6 +1147,7 @@ static void DispatchAsyncOp()
 			G_opRecords = newOp;
 		}
 	} else {
+		LOG_WARNING("GEOSHOST: Failed to allocate async op");
 		G_responseBuffer[0] = HIF_NO_MEMORY;
 	}
 	G_responseOffset = 6;
@@ -1201,21 +1167,25 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 		G_commandOffset++;
 
 		if (G_commandOffset == (sizeof(G_commandBuffer) / sizeof(uint16_t))) {
-			if (G_commandBuffer[0] == HIF_SET_VIDEO_PARAMS) {
+			switch (G_commandBuffer[0]) {
 
+			case HIF_SET_VIDEO_PARAMS: {
 				MOUSEDOS_BeforeNewVideoMode();
 				uint16_t newWidth  = G_commandBuffer[1];
 				uint16_t newHeight = G_commandBuffer[2];
 				VESA_SetBaseboxMode(newWidth, newHeight);
-				LOG_INFO("GEOSHOST:Set basebox video mode");
+				LOG_INFO("GEOSHOST: Set video mode %dx%d",
+				         newWidth,
+				         newHeight);
 				MOUSEDOS_AfterNewVideoMode(false);
 
 				G_responseBuffer[0] = HIF_OK;
 				G_responseBuffer[2] = 0x89A;
 				G_responseOffset    = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_CHECK_API) {
-
+			case HIF_CHECK_API: {
 				uint16_t resultVersion = 0;
 
 				/* full response buffer */
@@ -1232,6 +1202,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				G_responseBuffer[4] = (((uint16_t)G_baseboxID[7])
 				                       << 8) |
 				                      G_baseboxID[6];
+
 				/* Return API specific version, 0 if API is not
 				 * supported */
 				switch (G_commandBuffer[1]) {
@@ -1239,22 +1210,23 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				case HIF_API_VIDEO: resultVersion = 1; break;
 				case HIF_API_SOCKET: resultVersion = 2; break;
 				case HIF_API_SSL: resultVersion = 1; break;
-				default:
-					resultVersion = 0; /* any other
-					                      unsupported API:
-					                      not supported */
+				default: resultVersion = 0; break;
 				}
-				G_responseBuffer[5] = resultVersion; /* minor
-				                            (compatibility) version
-				                          */
+				G_responseBuffer[5] = resultVersion;
+				LOG_INFO("GEOSHOST: API check: api=%d version=%d",
+				         G_commandBuffer[1],
+				         resultVersion);
 				G_responseOffset = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_SET_EVENT_INTERRUPT) {
+			case HIF_SET_EVENT_INTERRUPT:
 				G_protectedOpMode = cpu.pmode;
 				G_eventInterrupt =
 				        0xA0 /* G_commandBuffer[1] & 0xFF*/;
-			} else if (G_commandBuffer[0] == HIF_GET_VIDEO_PARAMS) {
+				break;
 
+			case HIF_GET_VIDEO_PARAMS: {
 				float ddpi, hdpi, vdpi;
 
 				int displayIndex = SDL_GetWindowDisplayIndex(
@@ -1264,13 +1236,9 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				SDL_GL_GetDrawableSize(GFX_GetWindow(), &width, &height);
 
 				G_responseBuffer[0] = HIF_OK;
-				// G_responseBuffer[1] = sdl.draw_rect_px.w; /*
-				// native width */ G_responseBuffer[2] =
-				// sdl.draw_rect_px.h; /* native height */
 				G_responseBuffer[1] = width;  /* native width */
 				G_responseBuffer[2] = height; /* native height */
 
-				// Get the DPI of the first display (index 0)
 				if (SDL_GetDisplayDPI(displayIndex, &ddpi, &hdpi, &vdpi) ==
 				    0) {
 					G_responseBuffer[3] = hdpi; /* horizontal
@@ -1278,28 +1246,24 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 					G_responseBuffer[4] = vdpi; /* vertical
 					                               dpi */
 				} else {
-					/* error getting the dpi */
-					G_responseBuffer[3] = 0; /* horizontal
-					                            dpi */
-					G_responseBuffer[4] = 0; /* vertical dpi */
+					G_responseBuffer[3] = 0;
+					G_responseBuffer[4] = 0;
 				}
-				LOG_MSG("GEOSHOST: Current host window resolution (x,y,dpi_x,dpi_y): %d, %d, %d, %d",
-				        width,
-				        height,
-				        G_responseBuffer[3],
-				        G_responseBuffer[4]);
+				GH_DBG("Display resolution: %dx%d dpi=%dx%d",
+				       width,
+				       height,
+				       G_responseBuffer[3],
+				       G_responseBuffer[4]);
 				G_responseBuffer[5] = 0; /* unused */
 				G_responseOffset    = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_GET_EVENT) {
-
-				// Add Event to list
+			case HIF_GET_EVENT:
 				SDL_mutexP(G_eventQueueMutex);
 				if (G_eventRecords == NULL) {
 					G_responseBuffer[0] = HIF_NOT_FOUND;
-
 				} else {
-
 					EventRecord* thisRecord = G_eventRecords;
 					thisRecord->GetRecordData(G_responseBuffer);
 					G_eventRecords = thisRecord->GetNext();
@@ -1307,17 +1271,14 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				}
 				G_responseOffset = 6;
 				SDL_mutexV(G_eventQueueMutex);
-			} else if (G_commandBuffer[0] == HIF_NC_RESOLVE_ADDR) {
+				break;
 
+			case HIF_NC_RESOLVE_ADDR:
 				DispatchAsyncOp<AsyncSocketResolveAddr>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_NC_ALLOC_CONNECTION) {
-
+			case HIF_NC_ALLOC_CONNECTION: {
 				int socketHandle = -1;
-
-				//__android_log_print(ANDROID_LOG_DEBUG,
-				//"GeosHost",
-				//"NetAllocConnection");
 
 				int i = G_lookupNext;
 				do {
@@ -1332,20 +1293,20 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				} while (i != G_lookupNext);
 
 				if (socketHandle != -1) {
-
 					G_lookupNext = i + 1;
 					if (G_lookupNext >= MaxSockets) {
 						G_lookupNext = 1;
 					}
 				}
 
-				if (socketHandle < 0) { // no free sockets
-					LOG_MSG("ERROR No free sockets");
+				if (socketHandle < 0) {
+					LOG_WARNING("GEOSHOST: No free sockets");
 					G_responseBuffer[0] = HIF_TABLE_FULL;
 					return;
 				}
 
-				LOG_MSG("Opening socket handle %d\n", socketHandle);
+				LOG_INFO("GEOSHOST: Allocated socket %d",
+				         socketHandle);
 				SocketState& sock = NetSockets[socketHandle];
 
 				sock.used          = true;
@@ -1359,144 +1320,110 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 				G_responseBuffer[0] = HIF_OK;
 				G_responseBuffer[1] = (uint16_t)socketHandle;
+				G_responseOffset    = 6;
+				break;
+			}
 
-				G_responseOffset = 6;
-
-			} else if (G_commandBuffer[0] == HIF_NC_CONNECT_REQUEST) {
-
+			case HIF_NC_CONNECT_REQUEST:
 				DispatchAsyncOp<AsyncSocketConnect>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_NC_SEND_DATA) {
-
+			case HIF_NC_SEND_DATA:
 				DispatchAsyncOp<AsyncSocketSend>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_NC_RECV_NEXT_CLOSE) {
-
+			case HIF_NC_RECV_NEXT_CLOSE: {
 				G_responseBuffer[0] = HIF_OK;
 				for (int i = 0; i < MaxSockets; i++) {
-
-					if (NetSockets[i].used) {
-
-						if (!NetSockets[i].done) {
-							if (NetSockets[i].receiveDone) {
-
-								NetSockets[i].done = true;
-								G_responseBuffer[1] = i;
-								G_responseBuffer[2] =
-								        !NetSockets[i].sendDone
-								                ? 0
-								                : 0xFFFF;
-								if (i > 0) {
-									LOG_MSG("NetRecvNextClosed: %d %d",
-									        i,
-									        G_responseBuffer[2]);
-								}
-								G_responseOffset = 6;
-
-								if (NetSockets[i]
-								            .sendDone) {
-									NetSockets[i]
-									        .used = false;
-								}
-
-								return;
+					if (NetSockets[i].used && !NetSockets[i].done) {
+						if (NetSockets[i].receiveDone) {
+							NetSockets[i].done = true;
+							G_responseBuffer[1] = i;
+							G_responseBuffer[2] =
+							        NetSockets[i].sendDone
+							                ? 0xFFFF
+							                : 0;
+							if (i > 0) {
+								GH_DBG("RecvNextClosed: socket=%d sendDone=%x",
+								       i,
+								       G_responseBuffer[2]);
 							}
+							G_responseOffset = 6;
+
+							if (NetSockets[i].sendDone) {
+								NetSockets[i].used = false;
+							}
+							return;
 						}
 					}
 				}
 				G_responseBuffer[1] = 0;
 				G_responseOffset    = 6;
-			} else if (G_commandBuffer[0] == HIF_NC_NEXT_RECV_SIZE) {
+				break;
+			}
 
-				// init, return value with no bug pending
+			case HIF_NC_NEXT_RECV_SIZE: {
 				G_responseBuffer[0] = HIF_OK;
 				G_responseBuffer[1] = 0;
 
 				for (int i = 0; i < MaxSockets; i++) {
-
-					if (NetSockets[i].used) {
-
-						if (!NetSockets[i].done) {
-							// check if received
-							// data pending
-							if (NetSockets[i].recvBufUsed >
-							    0) {
-
-								// return size;
-								G_responseBuffer[1] =
-								        NetSockets[i]
-								                .recvBufUsed;
-								G_responseBuffer[2] = i;
-								break;
-							}
+					if (NetSockets[i].used && !NetSockets[i].done) {
+						if (NetSockets[i].recvBufUsed > 0) {
+							G_responseBuffer[1] =
+							        NetSockets[i].recvBufUsed;
+							G_responseBuffer[2] = i;
+							break;
 						}
 					}
 				}
 				if (G_responseBuffer[1] > 0) {
-					LOG_MSG("NetNextRecvSize: %d %d",
-					        G_responseBuffer[1],
-					        G_responseBuffer[2]);
+					GH_DBG("NextRecvSize: %d bytes on socket %d",
+					       G_responseBuffer[1],
+					       G_responseBuffer[2]);
 				}
 				G_responseOffset = 6;
-			} else if (G_commandBuffer[0] == HIF_NC_RECV_NEXT) {
+				break;
+			}
 
-				// find available socket with
+			case HIF_NC_RECV_NEXT: {
 				for (int i = 0; i < MaxSockets; i++) {
+					if (NetSockets[i].used && !NetSockets[i].done) {
+						GH_DBG("RecvNext: socket=%u bufUsed=%d expected=%d",
+						       i,
+						       NetSockets[i].recvBufUsed,
+						       G_commandBuffer[1]);
 
-					if (NetSockets[i].used) {
+						if (NetSockets[i].recvBufUsed ==
+						    G_commandBuffer[1]) {
+							int size = G_commandBuffer[1];
 
-						if (!NetSockets[i].done) {
-							// check if recived data
-							// pending
-							LOG_MSG("RECEIVENEXT: %d %d (%u)",
-							        NetSockets[i].recvBufUsed,
-							        G_commandBuffer[1],
-							        i);
+							GH_DBG("RecvNext: copying %d bytes to %x:%x",
+							       size,
+							       G_commandBuffer[2],
+							       G_commandBuffer[3]);
+							WriteDosMemory(
+							        G_commandBuffer[2],
+							        G_commandBuffer[3],
+							        NetSockets[i].recvBuf,
+							        size);
 
-							if (NetSockets[i].recvBufUsed ==
-							    G_commandBuffer[1]) {
-
-								// found buffer
-								// of right size
-								// copy it
-								// PhysPt
-								// dosBuff =
-								//        SegPhys(es)
-								//        +
-								//        reg_di;
-								int size = G_commandBuffer[1];
-
-								LOG_MSG("RECEIVENEXT: %x %x",
-								        G_commandBuffer[2],
-								        G_commandBuffer[3]);
-								WriteDosMemory(
-								        G_commandBuffer[2],
-								        G_commandBuffer[3],
-								        NetSockets[i]
-								                .recvBuf,
-								        size);
-
-								// mark unused,
-								// so continue
-								// receiving
-								NetSockets[i].recvBufUsed = 0;
-
-								G_responseBuffer[1] = i;
-								break;
-							}
+							NetSockets[i].recvBufUsed = 0;
+							G_responseBuffer[1] = i;
+							break;
 						}
 					}
 					G_responseOffset = 6;
 				}
-			} else if (G_commandBuffer[0] == HIF_NC_DISCONNECT) {
-				// actually close
-				LOG_MSG("NetDisconnect: %d %d",
-				        G_commandBuffer[1],
-				        G_commandBuffer[2]);
+				break;
+			}
+
+			case HIF_NC_DISCONNECT: {
+				LOG_INFO("GEOSHOST: Disconnect socket=%d full=%d",
+				         G_commandBuffer[1],
+				         G_commandBuffer[2]);
 				SocketState& sock = NetSockets[G_commandBuffer[1]];
 
 				if (sock.used) {
-					// sock.done = true;
 					sock.sendDone = true;
 					if (sock.stream) {
 						NET_DestroyStreamSocket(sock.stream);
@@ -1513,10 +1440,12 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				}
 				G_responseBuffer[0] = HIF_OK;
 				G_responseOffset    = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_NC_CONNECTED) {
-				// actually close
-				LOG_MSG("NetConnected: %d", G_commandBuffer[1]);
+			case HIF_NC_CONNECTED: {
+				LOG_INFO("GEOSHOST: Socket %d marked connected",
+				         G_commandBuffer[1]);
 				SocketState& sock = NetSockets[G_commandBuffer[1]];
 
 				if (sock.used) {
@@ -1524,67 +1453,54 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				}
 				G_responseBuffer[0] = HIF_OK;
 				G_responseOffset    = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_SSL_CTX_NEW) {
-				LOG_MSG("!!!SSLContextNew");
-
+			case HIF_SSL_CTX_NEW: {
 				int method = 0; // client method
-
 				int handle = AllocHandle(
 				        tls_create_context(method, TLS_V12));
 
-				// SSL_set_io(reinterpret_cast<struct
-				// TLSContext*>(
-				//                    handles[handle - 1]),
-				//            (void*)SSLSocketRecv,
-				//            (void*)SSLSocketSend);
-
-				// reg_ax = handle & 0xFFFF;
-				// reg_dx = (handle >> 16) & 0xFFFF;
-				LOG_MSG("!!!SSLContextNew context %x", handle);
+				GH_DBG("SSL_CTX_NEW: handle=%x", handle);
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = handle & 0xFFFF;
 				G_responseOffset              = 6;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_SSL_NEW) {
-
-				LOG_MSG("!!!SSLNew(%x)", SDL_ThreadID());
-
+			case HIF_SSL_NEW: {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
 
 				struct TLSContext* context =
 				        reinterpret_cast<struct TLSContext*>(
 				                handles[handle - 1]);
 
-				LOG_MSG("!!!SSLNew context %d, %x", handle, context);
+				GH_DBG("SSL_NEW: ctx_handle=%d context=%p",
+				       handle,
+				       context);
 
 				int method = 0; // client method
 				struct TLSContext* context2 =
 				        tls_create_context(method, TLS_V12);
-				// tls_load_root_certificates(context2,
-				//                           (const unsigned
-				//                           char*) ROOT_CA_DEF,
-				//                           ROOT_CA_DEF_LEN);
-				// SSL_CTX_root_ca(context2, "D:\\cacert.pem");
-
 				int newHandle = AllocHandle(context2);
 
-				LOG_MSG("!!!SSLNew result %d", newHandle);
+				GH_DBG("SSL_NEW: ssl_handle=%d", newHandle);
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = newHandle & 0xFFFF;
 				G_responseOffset = 6;
-			} else if (G_commandBuffer[0] == HIF_SSL_SET_SSL_METHOD) {
+				break;
+			}
 
+			case HIF_SSL_SET_SSL_METHOD:
 				G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
 				G_responseBuffer[HIF_SLOT_DX] = 0;
 				G_responseOffset              = 6;
-			} else if (G_commandBuffer[0] == HIF_SSL_SET_FD) {
+				break;
 
+			case HIF_SSL_SET_FD: {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
-				LOG_MSG("!!!SSLSetFD %x", handle);
-
 				int socket = G_commandBuffer[HIF_SLOT_DI];
-				LOG_MSG("!!!SSLSetFD socket %x", socket);
+				GH_DBG("SSL_SET_FD: handle=%x socket=%x", handle, socket);
 				associatedSocket[handle - 1] = socket;
 
 				NetSockets[socket].ssl = true;
@@ -1592,14 +1508,13 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
 				G_responseBuffer[HIF_SLOT_DX] = 0;
 				G_responseOffset              = 6;
-				LOG_MSG("!!!SSLSetFD done");
-			} else if (G_commandBuffer[0] == HIF_SSL_SET_TLSEXT_HOST_NAME) {
+				break;
+			}
 
+			case HIF_SSL_SET_TLSEXT_HOST_NAME: {
 				char host[256];
-				LOG_MSG("!!!HIF_SSL_SET_TLSEXT_HOST_NAME");
 
 				int handle = G_commandBuffer[HIF_SLOT_SI];
-				LOG_MSG("!!!SSLSetTLSEXT_HOST_NAME %x", handle);
 
 				struct TLSContext* ctx =
 				        reinterpret_cast<struct TLSContext*>(
@@ -1612,43 +1527,50 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				            reg_di);
 				host[G_commandBuffer[HIF_SLOT_DI]] = 0;
 
-				int result = tls_sni_set(ctx, host);
+				LOG_INFO("GEOSHOST: SNI hostname set: %s (handle=%x)",
+				         host,
+				         handle);
+				tls_sni_set(ctx, host);
 
-				// reg_ax = result & 0xFFFF;
-				// reg_dx = (result >> 16) & 0xFFFF;
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
 				G_responseBuffer[HIF_SLOT_DX] = 0;
+				break;
+			}
 
-			} else if (G_commandBuffer[0] == HIF_SSL_CONNECT) {
-
+			case HIF_SSL_CONNECT:
 				DispatchAsyncOp<AsyncSSLConnect>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_SSL_WRITE) {
-
+			case HIF_SSL_WRITE:
 				DispatchAsyncOp<AsyncSSLWrite>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_SSL_READ) {
-
+			case HIF_SSL_READ:
 				DispatchAsyncOp<AsyncSSLRead>();
+				break;
 
-			} else if (G_commandBuffer[0] == HIF_SSL_CTX_FREE) {
+			case HIF_SSL_CTX_FREE: {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
 				tls_destroy_context(
 				        (struct TLSContext*)handles[handle - 1]);
-				handles[handle - 1] = NULL;
-
+				handles[handle - 1]           = NULL;
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-			} else if (G_commandBuffer[0] == HIF_SSL_FREE) {
-				int handle = G_commandBuffer[HIF_SLOT_SI];
+				break;
+			}
 
+			case HIF_SSL_FREE: {
+				int handle = G_commandBuffer[HIF_SLOT_SI];
 				tls_destroy_context(
 				        (struct TLSContext*)handles[handle - 1]);
-				handles[handle - 1] = NULL;
-
+				handles[handle - 1]           = NULL;
 				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-			} else {
-				LOG_INFO("GEOSHOST: Unhandled request code: %d",
-				         G_commandBuffer[0]);
+				break;
+			}
+
+			default:
+				LOG_WARNING("GEOSHOST: Unhandled request code: %d",
+				            G_commandBuffer[0]);
+				break;
 			}
 		}
 	}
@@ -1666,12 +1588,12 @@ void GEOSHOST_Init()
 
 	TIMER_AddTickHandler(GeosHost_TickHandler);
 
-	LOG_INFO("GEOSHOST:Initialized");
+	LOG_INFO("GEOSHOST: Initialized");
 }
 
 void GEOSHOST_Exit()
 {
-
+	LOG_INFO("GEOSHOST: Shutting down");
 	NET_Quit();
 }
 
