@@ -1,4 +1,31 @@
-﻿#define CPP_MODULE
+﻿/**
+ * @file geoshost.cpp
+ * @brief GEOS Host Interface for DOSBox — bridges GEOS/PC applications to host
+ *        OS services (display, networking, TLS) via a virtual I/O port protocol.
+ *
+ * Architecture overview:
+ *   The GEOS guest communicates with this module through I/O port 0x38FF.
+ *   Commands are written as a sequence of 6 x 16-bit words; responses are read
+ *   back from the same port. Asynchronous operations (DNS resolution, TCP
+ *   connect, TLS handshake, send/recv) are polled by a timer tick handler and
+ *   deliver completion events via a software interrupt.
+ *
+ *   Functionality is divided into sub-APIs, each owning a set of command codes:
+ *     - Host  (api 0) : event interrupt setup, event queue
+ *     - Video (api 1) : display mode and DPI queries
+ *     - SSL   (api 2) : TLS context, handshake, read/write  [range 1200–1299]
+ *     - Socket(api 3) : TCP resolve, connect, send, recv     [range 1000–1199]
+ *
+ *   Sub-APIs self-register at init; command dispatch and version queries are
+ *   handled by a central dispatcher. See GeosHostSubAPI and its subclasses.
+ *
+ * Threading model:
+ *   Most operations run on the DOSBox main thread (tick handler). Some async
+ *   ops may optionally spawn an SDL thread (m_RunOwnThread), though all current
+ *   implementations use poll-based completion instead.
+ */
+
+#define CPP_MODULE
 
 #include "cpu/cpu.h"
 #include "dosbox.h"
@@ -16,6 +43,13 @@
 
 #if C_GEOSHOST
 
+/* ----------------------------------------------------------------
+ * Debug logging
+ *
+ * Set GEOSHOST_DEBUG to 1 to enable verbose debug traces (SSL
+ * handshake steps, buffer details, socket polling, recv/send sizes).
+ * In normal builds these compile to nothing.
+ * ---------------------------------------------------------------- */
 #define GEOSHOST_DEBUG 0
 
 #if GEOSHOST_DEBUG
@@ -24,13 +58,28 @@
 #define GH_DBG(fmt, ...) ((void)0)
 #endif
 
+/** Maximum number of concurrent asynchronous operations. */
 #define MAX_ASYNC_OP_SLOTS 16
 
+/* ----------------------------------------------------------------
+ * Sub-API identifiers
+ *
+ * Each sub-API is assigned a numeric ID used in HIF_CHECK_API
+ * requests. The GEOS client sends an API ID and receives the
+ * corresponding version number (0 = not supported).
+ * ---------------------------------------------------------------- */
 #define HIF_API_HOST   0
 #define HIF_API_VIDEO  1
 #define HIF_API_SSL    2
 #define HIF_API_SOCKET 3
 
+/* ----------------------------------------------------------------
+ * Command/response buffer slot indices
+ *
+ * The 6-word command and response buffers are indexed by these
+ * constants, which correspond to x86 register names used by the
+ * GEOS-side driver to pack/unpack parameters.
+ * ---------------------------------------------------------------- */
 #define HIF_SLOT_AX 0
 #define HIF_SLOT_SI 1
 #define HIF_SLOT_BX 2
@@ -38,73 +87,124 @@
 #define HIF_SLOT_DX 4
 #define HIF_SLOT_DI 5
 
+/* ----------------------------------------------------------------
+ * Event notification types (sent via the event interrupt)
+ * ---------------------------------------------------------------- */
 #define HIF_NOTIFY_DISPLAY_SIZE_CHANGE 1
 #define HIF_NOTIFY_SOCKET_STATE_CHANGE 2
 
-#define HIF_CHECK_API           98
-#define HIF_SET_VIDEO_PARAMS    4
-#define HIF_SET_EVENT_INTERRUPT 5
-#define HIF_EVENT_ASYNC_END     7
-#define HIF_GET_VIDEO_PARAMS    8
-#define HIF_GET_EVENT           9
+/* ----------------------------------------------------------------
+ * Core / host command codes (scattered in 0–99 range)
+ * ---------------------------------------------------------------- */
+#define HIF_CHECK_API           98 /**< Meta: query sub-API version */
+#define HIF_SET_VIDEO_PARAMS    4  /**< Set display resolution */
+#define HIF_SET_EVENT_INTERRUPT 5  /**< Register event interrupt vector */
+#define HIF_EVENT_ASYNC_END     7  /**< (reserved) async completion */
+#define HIF_GET_VIDEO_PARAMS    8  /**< Query display resolution + DPI */
+#define HIF_GET_EVENT           9  /**< Dequeue next pending event */
 
-#define HIF_OK                 0
-#define HIF_NOT_FOUND          1
-#define HIF_NO_MEMORY          2
-#define HIF_ASYNC_OP           3
-#define HIF_TABLE_FULL         4
-#define HIF_PENDING            5
-#define HIF_EVENT_NOTIFICATION 6
-#define HIF_FAILED             7
+/* ----------------------------------------------------------------
+ * Response status codes (returned in responseBuffer[0])
+ * ---------------------------------------------------------------- */
+#define HIF_OK         0 /**< Success */
+#define HIF_NOT_FOUND  1 /**< No matching item (e.g. empty event queue) */
+#define HIF_NO_MEMORY  2 /**< Allocation failed */
+#define HIF_ASYNC_OP   3 /**< Operation is asynchronous */
+#define HIF_TABLE_FULL 4 /**< Resource table exhausted */
+#define HIF_PENDING    5 /**< Async op still in progress (low byte) */
+#define HIF_EVENT_NOTIFICATION 6 /**< Event record is a notification */
+#define HIF_FAILED             7 /**< General failure */
 
-#define HIF_NETWORKING_BASE     1000
-#define HIF_NC_RESOLVE_ADDR     HIF_NETWORKING_BASE
-#define HIF_NC_ALLOC_CONNECTION HIF_NETWORKING_BASE + 1
-#define HIF_NC_CONNECT_REQUEST  HIF_NETWORKING_BASE + 2
-#define HIF_NC_SEND_DATA        HIF_NETWORKING_BASE + 3
-#define HIF_NC_NEXT_RECV_SIZE   HIF_NETWORKING_BASE + 4
-#define HIF_NC_RECV_NEXT        HIF_NETWORKING_BASE + 5
-#define HIF_NC_RECV_NEXT_CLOSE  HIF_NETWORKING_BASE + 6
-#define HIF_NC_CLOSE            HIF_NETWORKING_BASE + 7
-#define HIF_NC_DISCONNECT       HIF_NETWORKING_BASE + 8
-#define HIF_NC_CONNECTED        HIF_NETWORKING_BASE + 9
-#define HIF_NETWORKING_END      1199
+/* ----------------------------------------------------------------
+ * Networking (socket) command codes — contiguous range [1000, 1199]
+ * ---------------------------------------------------------------- */
+#define HIF_NETWORKING_BASE 1000
+#define HIF_NC_RESOLVE_ADDR HIF_NETWORKING_BASE /**< Start async DNS resolve */
+#define HIF_NC_ALLOC_CONNECTION \
+	HIF_NETWORKING_BASE + 1 /**< Allocate a socket slot */
+#define HIF_NC_CONNECT_REQUEST \
+	HIF_NETWORKING_BASE + 2                  /**< Start async TCP connect */
+#define HIF_NC_SEND_DATA HIF_NETWORKING_BASE + 3 /**< Send data on socket */
+#define HIF_NC_NEXT_RECV_SIZE \
+	HIF_NETWORKING_BASE + 4 /**< Poll for pending recv size */
+#define HIF_NC_RECV_NEXT \
+	HIF_NETWORKING_BASE + 5 /**< Copy received data to guest */
+#define HIF_NC_RECV_NEXT_CLOSE \
+	HIF_NETWORKING_BASE + 6              /**< Poll for closed sockets */
+#define HIF_NC_CLOSE HIF_NETWORKING_BASE + 7 /**< (reserved) close */
+#define HIF_NC_DISCONNECT \
+	HIF_NETWORKING_BASE + 8 /**< Disconnect / full close */
+#define HIF_NC_CONNECTED \
+	HIF_NETWORKING_BASE + 9 /**< Mark socket as connected */
+#define HIF_NETWORKING_END 1199
 
+/* ----------------------------------------------------------------
+ * SSL/TLS command codes — contiguous range [1200, 1299]
+ * ---------------------------------------------------------------- */
 #define HIF_SSL_BASE                 1200
-#define HIF_SSL_V2_GET_CLIENT_METHOD HIF_SSL_BASE
-#define HIF_SSL_SSLEAY_ADD_SSL_ALGO  HIF_SSL_BASE + 1
-#define HIF_SSL_CTX_NEW              HIF_SSL_BASE + 2
-#define HIF_SSL_CTX_FREE             HIF_SSL_BASE + 3
-#define HIF_SSL_NEW                  HIF_SSL_BASE + 4
-#define HIF_SSL_FREE                 HIF_SSL_BASE + 5
-#define HIF_SSL_SET_FD               HIF_SSL_BASE + 6
-#define HIF_SSL_CONNECT              HIF_SSL_BASE + 7
-#define HIF_SSL_SHUTDOWN             HIF_SSL_BASE + 8
-#define HIF_SSL_READ                 HIF_SSL_BASE + 9
-#define HIF_SSL_WRITE                HIF_SSL_BASE + 10
-#define HIF_SSL_V23_CLIENT_METHOD    HIF_SSL_BASE + 11
-#define HIF_SSL_V3_CLIENT_METHOD     HIF_SSL_BASE + 12
-#define HIF_SSL_GET_SSL_METHOD       HIF_SSL_BASE + 13
-#define HIF_SSL_SET_CALLBACK         HIF_SSL_BASE + 14
-#define HIF_SSL_SET_TLSEXT_HOST_NAME HIF_SSL_BASE + 15
-#define HIF_SSL_SET_SSL_METHOD       HIF_SSL_BASE + 16
-#define HIF_SSL_END                  1299
+#define HIF_SSL_V2_GET_CLIENT_METHOD HIF_SSL_BASE     /**< (legacy, unused) */
+#define HIF_SSL_SSLEAY_ADD_SSL_ALGO  HIF_SSL_BASE + 1 /**< (legacy, unused) */
+#define HIF_SSL_CTX_NEW              HIF_SSL_BASE + 2 /**< Create TLS context */
+#define HIF_SSL_CTX_FREE HIF_SSL_BASE + 3 /**< Destroy TLS context */
+#define HIF_SSL_NEW      HIF_SSL_BASE + 4 /**< Create TLS session */
+#define HIF_SSL_FREE     HIF_SSL_BASE + 5 /**< Destroy TLS session */
+#define HIF_SSL_SET_FD HIF_SSL_BASE + 6 /**< Associate TLS handle with socket */
+#define HIF_SSL_CONNECT  HIF_SSL_BASE + 7  /**< Start async TLS handshake */
+#define HIF_SSL_SHUTDOWN HIF_SSL_BASE + 8  /**< (reserved) TLS shutdown */
+#define HIF_SSL_READ     HIF_SSL_BASE + 9  /**< Start async TLS read */
+#define HIF_SSL_WRITE    HIF_SSL_BASE + 10 /**< Start async TLS write */
+#define HIF_SSL_V23_CLIENT_METHOD    HIF_SSL_BASE + 11 /**< (legacy, unused) */
+#define HIF_SSL_V3_CLIENT_METHOD     HIF_SSL_BASE + 12 /**< (legacy, unused) */
+#define HIF_SSL_GET_SSL_METHOD       HIF_SSL_BASE + 13 /**< (legacy, unused) */
+#define HIF_SSL_SET_CALLBACK         HIF_SSL_BASE + 14 /**< (legacy, unused) */
+#define HIF_SSL_SET_TLSEXT_HOST_NAME HIF_SSL_BASE + 15 /**< Set SNI hostname */
+#define HIF_SSL_SET_SSL_METHOD HIF_SSL_BASE + 16 /**< (stub, returns FAILED) */
+#define HIF_SSL_END            1299
 
+/* ----------------------------------------------------------------
+ * I/O port protocol state
+ *
+ * Communication uses a simple word-at-a-time protocol on port 0x38FF:
+ *   Write side: guest writes 6 words sequentially (G_commandBuffer).
+ *               On the 6th word, the command is dispatched.
+ *   Read side:  guest reads words back from G_responseBuffer
+ *               (G_responseOffset counts down from 6 to 0).
+ *
+ * G_baseboxID is a magic identification string returned by HIF_CHECK_API
+ * so the GEOS driver can confirm it is talking to this host module.
+ * ---------------------------------------------------------------- */
 const static char G_baseboxID[]  = "XOBESAB2";
 static uint8_t G_baseboxIDOffset = 1;
 
-static uint8_t G_commandOffset = 0;
-static uint16_t G_commandBuffer[6];
-static uint8_t G_responseOffset = 0;
-static uint16_t G_responseBuffer[6];
-static uint8_t G_eventInterrupt = 0;
-SDL_mutex* G_eventQueueMutex    = NULL;
-bool G_recheckEventInterrupt    = false;
-bool G_protectedOpMode          = false;
-static uint16_t G_nextAsyncID   = 1;
+static uint8_t G_commandOffset = 0;  /**< Next write position in commandBuffer
+                                        (0–5) */
+static uint16_t G_commandBuffer[6];  /**< Accumulates the 6-word command from
+                                        guest */
+static uint8_t G_responseOffset = 0; /**< Remaining words to read (counts down
+                                        from 6) */
+static uint16_t G_responseBuffer[6]; /**< Response words returned to guest */
+static uint8_t G_eventInterrupt = 0; /**< Software interrupt vector for event
+                                        delivery (0 = disabled) */
+SDL_mutex* G_eventQueueMutex = NULL; /**< Protects G_eventRecords linked list */
+bool G_recheckEventInterrupt = false; /**< Set when a new event is queued;
+                                         triggers interrupt on next tick */
+bool G_protectedOpMode = false;       /**< CPU mode (real/protected) when event
+                                         interrupt was registered */
+static uint16_t G_nextAsyncID = 1;    /**< Monotonic counter for async operation
+                                         IDs */
 
-static int G_lookupNext = 1;
+static int G_lookupNext = 1; /**< Round-robin index for socket allocation (slot
+                                0 is reserved) */
 
+/**
+ * @class EventRecord
+ * @brief A node in the singly-linked event queue delivered to the GEOS guest.
+ *
+ * Events are 6-word records (same layout as the response buffer). They are
+ * created by GeosHost_SendEvent(), enqueued under mutex, and dequeued by
+ * the HIF_GET_EVENT command. When the queue transitions from empty to
+ * non-empty, a software interrupt is triggered on the next tick.
+ */
 class EventRecord {
 private:
 	volatile uint16_t m_Payload[6];
@@ -124,6 +224,8 @@ public:
 	{
 		return m_Next;
 	}
+
+	/** Copy the 6-word payload into the caller's buffer. */
 	void GetRecordData(uint16_t* recordBuf)
 	{
 		memcpy(recordBuf, (const void*)m_Payload, sizeof(m_Payload));
@@ -131,6 +233,23 @@ public:
 };
 
 #define UNALLOC_ASYNC_OP_ID 0
+
+/**
+ * @class AsyncOp
+ * @brief Base class for asynchronous operations (DNS resolve, connect, TLS,
+ * send).
+ *
+ * Lifecycle:
+ *   1. Subclass is constructed, linked into the G_opRecords list.
+ *   2. Init() reads command parameters and either starts a thread
+ *      (m_RunOwnThread=true) or sets up poll-based completion.
+ *      Returns HIF_PENDING | (slotID << 8) on success.
+ *   3. PollStatus() is called every tick. When the operation completes,
+ *      it writes the result into m_Result[].
+ *   4. HandleCompletion() detects m_Result[0] != HIF_PENDING, sends an
+ *      event to the guest with the result, and marks m_EventSent.
+ *   5. Cleanup() removes completed ops from the linked list.
+ */
 
 class AsyncOp {
 private:
@@ -176,6 +295,7 @@ public:
 	void HandleCompletion();
 };
 
+/** @brief Async DNS hostname resolution via SDL3_net. Poll-based (no thread). */
 class AsyncSocketResolveAddr : public AsyncOp {
 private:
 	char m_hostname[256];
@@ -193,6 +313,8 @@ public:
 	uint16_t PollStatus();
 };
 
+/** @brief Async TCP connect: resolves address, then establishes connection.
+ * Poll-based. */
 class AsyncSocketConnect : public AsyncOp {
 private:
 	enum State { IDLE, RESOLVING, CONNECTING, CONNECTED, DONE };
@@ -214,6 +336,10 @@ public:
 	uint16_t PollStatus();
 };
 
+/**
+ * @brief Async TLS handshake. Alternates between SENDING and RECEIVING
+ *        states until tls_established() reports success.
+ */
 class AsyncSSLConnect : public AsyncOp {
 private:
 	enum State { IDLE, SENDING, RECEIVING, DONE };
@@ -236,6 +362,8 @@ public:
 	uint16_t PollStatus();
 };
 
+/** @brief Async TLS write: encrypts data via tls_write(), sends ciphertext on
+ * socket. */
 class AsyncSSLWrite : public AsyncOp {
 private:
 	struct TLSContext* m_ctx;
@@ -256,14 +384,18 @@ public:
 	uint16_t PollStatus();
 };
 
+/**
+ * @brief Async TLS read: receives ciphertext from socket, decrypts via
+ *        tls_read(), and copies plaintext into guest memory.
+ */
 class AsyncSSLRead : public AsyncOp {
 private:
 	struct TLSContext* m_ctx;
 	int m_socketHandle;
 	uint8_t m_Buffer[8192];
-	uint16_t m_BufferSegment;
-	uint16_t m_BufferOffset;
-	uint16_t m_BufferSize;
+	uint16_t m_BufferSegment; /**< Guest memory segment for result */
+	uint16_t m_BufferOffset;  /**< Guest memory offset for result */
+	uint16_t m_BufferSize;    /**< Maximum bytes to read */
 
 public:
 	AsyncSSLRead(AsyncOp* next) : AsyncOp(next)
@@ -278,6 +410,7 @@ public:
 	uint16_t PollStatus();
 };
 
+/** @brief Async TCP send: writes data from guest memory to a stream socket. */
 class AsyncSocketSend : public AsyncOp {
 private:
 	uint16_t m_socketHandle;
@@ -291,19 +424,27 @@ public:
 	uint16_t PollStatus();
 };
 
+/**
+ * @struct SocketState
+ * @brief Per-socket state for the networking sub-API.
+ *
+ * Socket slot 0 is reserved (G_lookupNext starts at 1).
+ * Fields are volatile because PollSockets() may run on the tick handler
+ * while async operations modify state from their completion path.
+ */
 struct SocketState {
-	volatile bool used;
-	volatile bool open;
-	volatile bool blocking;
-	// NET_StreamSocket socketSet;
-	NET_StreamSocket* stream;
-	char* recvBuf;
-	volatile int recvBufUsed;
-	volatile bool receiveDone;
-	volatile bool sendDone;
-	volatile bool done;
-	volatile bool ssl;
-	volatile bool sslInitialEnd;
+	volatile bool used;       /**< Slot is allocated */
+	volatile bool open;       /**< Socket is ready for I/O */
+	volatile bool blocking;   /**< (reserved) blocking mode flag */
+	NET_StreamSocket* stream; /**< SDL3_net stream socket handle */
+	char* recvBuf; /**< Receive buffer (allocated on first recv) */
+	volatile int recvBufUsed; /**< Bytes currently in recvBuf (0 = empty) */
+	volatile bool receiveDone; /**< Remote side closed the read channel */
+	volatile bool sendDone; /**< Local side finished sending / closed write */
+	volatile bool done;     /**< Socket fully closed */
+	volatile bool ssl; /**< Socket is used for TLS (skip plain polling) */
+	volatile bool sslInitialEnd; /**< TLS recv ended during
+	                                handshake/initial phase */
 
 	SocketState()
 	        : used(false),
@@ -317,15 +458,31 @@ struct SocketState {
 	{}
 };
 
-static const int MaxSockets = 256;
+static const int MaxSockets = 256; /**< Maximum concurrent socket slots */
 
-static SocketState NetSockets[MaxSockets];
+static SocketState NetSockets[MaxSockets]; /**< Socket slot table (index 0
+                                              reserved) */
 
-EventRecord* G_eventRecords = NULL;
-AsyncOp* G_opRecords        = NULL;
+EventRecord* G_eventRecords = NULL; /**< Head of the pending event queue
+                                       (singly-linked) */
+AsyncOp* G_opRecords = NULL; /**< Head of the active async operation list */
 
-void GeosHost_NotifySocketChange();
+void GeosHost_NotifySocketChange(); /* Forward declaration */
 
+/* ----------------------------------------------------------------
+ * Guest memory access helpers
+ *
+ * The GEOS guest may be in real mode (segment << 4 + offset) or
+ * protected mode (GDT descriptor base + offset). These helpers
+ * abstract the difference so command handlers don't need to branch.
+ * ---------------------------------------------------------------- */
+
+/**
+ * @brief Resolve a guest segment:offset pair to a physical address.
+ * @param segment  Real-mode segment or protected-mode selector
+ * @param offset   Offset within the segment
+ * @return Physical address suitable for mem_readb/mem_writeb
+ */
 static uint32_t ResolveAddress(uint16_t segment, uint16_t offset)
 {
 	if (G_protectedOpMode) {
@@ -337,6 +494,7 @@ static uint32_t ResolveAddress(uint16_t segment, uint16_t offset)
 	}
 }
 
+/** @brief Copy @p size bytes from guest memory into @p dest. */
 static void ReadDosMemory(uint16_t segment, uint16_t offset, void* dest, int size)
 {
 	uint32_t addr = ResolveAddress(segment, offset);
@@ -346,6 +504,7 @@ static void ReadDosMemory(uint16_t segment, uint16_t offset, void* dest, int siz
 	}
 }
 
+/** @brief Copy @p size bytes from @p src into guest memory. */
 static void WriteDosMemory(uint16_t segment, uint16_t offset, const void* src, int size)
 {
 	uint32_t addr      = ResolveAddress(segment, offset);
@@ -357,8 +516,34 @@ static void WriteDosMemory(uint16_t segment, uint16_t offset, const void* src, i
 
 // ============================================================
 // Sub-API framework
+//
+// Each functional area (host, video, networking, SSL) is implemented
+// as a subclass of GeosHostSubAPI. Sub-APIs register themselves at
+// init; the dispatcher routes incoming commands to the first sub-API
+// whose HandlesCommand() returns true.
+//
+// Two flavours exist:
+//   RangeSubAPI  — owns a contiguous command code range (e.g. 1000–1199)
+//   MappedSubAPI — owns an explicit list of scattered command codes
+//
+// The registration step checks for overlapping command ownership
+// between all pairs (range×range, range×map, map×map).
 // ============================================================
 
+/**
+ * @class GeosHostSubAPI
+ * @brief Abstract base for all host interface sub-APIs.
+ *
+ * Subclasses must implement:
+ *   - GetApiID()        — numeric ID used in HIF_CHECK_API
+ *   - GetVersion()      — version number reported to the guest
+ *   - HandlesCommand()  — returns true if this sub-API owns the command code
+ *   - HandleCommand()   — executes the command, reading from G_commandBuffer
+ *                          and writing to G_responseBuffer / G_responseOffset
+ *
+ * For overlap checking at registration time, subclasses should also
+ * override GetCommandList() (map-based) or GetCommandRange() (range-based).
+ */
 class GeosHostSubAPI {
 public:
 	virtual ~GeosHostSubAPI() {}
@@ -367,18 +552,24 @@ public:
 	virtual bool HandlesCommand(uint16_t cmd) const = 0;
 	virtual void HandleCommand(uint16_t cmd)        = 0;
 
-	// For overlap checking at registration
+	/** Return the explicit command list (map-based sub-APIs). */
 	virtual int GetCommandList(const uint16_t** outList) const
 	{
 		*outList = nullptr;
 		return 0;
 	}
+	/** Return the command range bounds (range-based sub-APIs). */
 	virtual bool GetCommandRange(uint16_t& min, uint16_t& max) const
 	{
 		return false;
 	}
 };
 
+/**
+ * @class RangeSubAPI
+ * @brief Sub-API that owns a contiguous command code range [min, max].
+ *        Used by networking (1000–1199) and SSL (1200–1299).
+ */
 class RangeSubAPI : public GeosHostSubAPI {
 protected:
 	uint8_t m_apiID;
@@ -415,6 +606,12 @@ public:
 	}
 };
 
+/**
+ * @class MappedSubAPI
+ * @brief Sub-API that owns an explicit list of command codes.
+ *        Used by host and video sub-APIs whose commands are scattered
+ *        in the 0–99 range.
+ */
 class MappedSubAPI : public GeosHostSubAPI {
 protected:
 	uint8_t m_apiID;
@@ -455,10 +652,14 @@ public:
 	}
 };
 
-// Concrete sub-API declarations
+/* ----------------------------------------------------------------
+ * Concrete sub-API declarations
+ * ---------------------------------------------------------------- */
 
+/** Command codes owned by the Host sub-API (event management). */
 static const uint16_t HostCommands[] = {HIF_SET_EVENT_INTERRUPT, HIF_GET_EVENT};
 
+/** @brief Host sub-API: event interrupt registration and event queue. */
 class HostSubAPI : public MappedSubAPI {
 public:
 	HostSubAPI()
@@ -468,8 +669,10 @@ public:
 	void HandleCommand(uint16_t cmd) override;
 };
 
+/** Command codes owned by the Video sub-API (display management). */
 static const uint16_t VideoCommands[] = {HIF_SET_VIDEO_PARAMS, HIF_GET_VIDEO_PARAMS};
 
+/** @brief Video sub-API: display mode setting and resolution/DPI queries. */
 class VideoSubAPI : public MappedSubAPI {
 public:
 	VideoSubAPI()
@@ -479,6 +682,7 @@ public:
 	void HandleCommand(uint16_t cmd) override;
 };
 
+/** @brief Networking sub-API: TCP socket management [range 1000–1199]. */
 class NetworkSubAPI : public RangeSubAPI {
 public:
 	NetworkSubAPI()
@@ -487,6 +691,8 @@ public:
 	void HandleCommand(uint16_t cmd) override;
 };
 
+/** @brief SSL/TLS sub-API: context/session management, handshake, I/O [range
+ * 1200–1299]. */
 class SSLSubAPI : public RangeSubAPI {
 public:
 	SSLSubAPI() : RangeSubAPI(HIF_API_SSL, 1, HIF_SSL_BASE, HIF_SSL_END) {}
@@ -495,13 +701,25 @@ public:
 
 // ============================================================
 // Sub-API dispatcher
+//
+// Manages registration and command routing for all sub-APIs.
+// HIF_CHECK_API is handled directly by write_baseboxcmd (not
+// dispatched) because it needs to query across all sub-APIs.
 // ============================================================
 
-#define MAX_SUB_APIS 8
+#define MAX_SUB_APIS 8 /**< Maximum number of registered sub-APIs */
 
-static GeosHostSubAPI* G_subAPIs[MAX_SUB_APIS];
-static int G_subAPICount = 0;
+static GeosHostSubAPI* G_subAPIs[MAX_SUB_APIS]; /**< Registered sub-API
+                                                   instances */
+static int G_subAPICount = 0; /**< Current number of registered sub-APIs */
 
+/**
+ * @brief Check whether two sub-APIs have overlapping command ownership.
+ *
+ * Handles all combinations: map×map (command-by-command), map×range
+ * (each mapped command tested against range), range×range (interval
+ * intersection). Returns true if any overlap is detected.
+ */
 static bool CheckOverlap(const GeosHostSubAPI* a, const GeosHostSubAPI* b)
 {
 	// Check a's mapped commands against b
@@ -530,6 +748,16 @@ static bool CheckOverlap(const GeosHostSubAPI* a, const GeosHostSubAPI* b)
 	return false;
 }
 
+/**
+ * @brief Register a sub-API with the dispatcher.
+ *
+ * Checks for command overlap with all previously registered sub-APIs.
+ * Logs a warning and returns false on overlap or table full.
+ *
+ * @param api  Pointer to a sub-API instance (must remain valid for module
+ * lifetime)
+ * @return true on success, false on overlap or table full
+ */
 static bool RegisterSubAPI(GeosHostSubAPI* api)
 {
 	if (G_subAPICount >= MAX_SUB_APIS) {
@@ -553,6 +781,8 @@ static bool RegisterSubAPI(GeosHostSubAPI* api)
 	return true;
 }
 
+/** @brief Look up the version of a sub-API by its ID. Returns 0 if not
+ * registered. */
 static uint16_t GetSubAPIVersion(uint8_t apiID)
 {
 	for (int i = 0; i < G_subAPICount; i++) {
@@ -563,6 +793,11 @@ static uint16_t GetSubAPIVersion(uint8_t apiID)
 	return 0;
 }
 
+/**
+ * @brief Route a command to the appropriate sub-API.
+ * @param cmd  Command code (G_commandBuffer[0])
+ * @return true if a sub-API handled the command, false if unrecognized
+ */
 static bool DispatchToSubAPI(uint16_t cmd)
 {
 	for (int i = 0; i < G_subAPICount; i++) {
@@ -574,6 +809,14 @@ static bool DispatchToSubAPI(uint16_t cmd)
 	return false;
 }
 
+/**
+ * @brief Poll all active non-SSL sockets for incoming data.
+ *
+ * Called from the tick handler. For each socket that is open, not done,
+ * not SSL, and has an empty receive buffer, attempts a non-blocking read.
+ * On success, stores the data and fires a socket state change notification.
+ * On error, marks the socket's receive channel as done.
+ */
 static void PollSockets()
 {
 
@@ -603,6 +846,15 @@ static void PollSockets()
 	}
 }
 
+/**
+ * @brief Timer tick handler — drives async operations and event delivery.
+ *
+ * Called every DOSBox timer tick. Performs three tasks:
+ *   1. Polls all active async operations for completion.
+ *   2. Polls sockets for incoming data (when in the correct CPU mode).
+ *   3. If an event is pending and interrupts are enabled, fires
+ *      the software interrupt to notify the GEOS guest.
+ */
 static void GeosHost_TickHandler(void)
 {
 
@@ -642,6 +894,13 @@ static void GeosHost_TickHandler(void)
 	}
 }
 
+/**
+ * @brief Enqueue a 6-word event record for delivery to the GEOS guest.
+ *
+ * Thread-safe (protected by G_eventQueueMutex). If the queue was empty,
+ * sets G_recheckEventInterrupt so the tick handler fires the software
+ * interrupt on the next cycle.
+ */
 void GeosHost_SendEvent(uint16_t* eventRecord)
 {
 	// Create Event Object
@@ -933,6 +1192,13 @@ uint16_t AsyncSocketResolveAddr::PollStatus()
 	return 0;
 }
 
+/**
+ * @brief I/O port read handler — returns the next response word.
+ *
+ * The guest reads from port 0x38FF to retrieve the response buffer
+ * one word at a time (G_responseOffset counts down from 6 to 0).
+ * Also resets G_commandOffset so the next write sequence starts fresh.
+ */
 static uint16_t read_baseboxid(io_port_t, io_width_t)
 {
 	uint16_t result = 0;
@@ -944,9 +1210,9 @@ static uint16_t read_baseboxid(io_port_t, io_width_t)
 	return result;
 }
 
+/** @brief Send a HIF_NOTIFY_DISPLAY_SIZE_CHANGE event to the GEOS guest. */
 void GeosHost_NotifyVideoChange()
 {
-	// send event to GEOS client
 	static uint16_t eventRecord[6];
 	eventRecord[0] = HIF_EVENT_NOTIFICATION;
 	eventRecord[1] = HIF_NOTIFY_DISPLAY_SIZE_CHANGE;
@@ -954,9 +1220,9 @@ void GeosHost_NotifyVideoChange()
 	GeosHost_SendEvent(eventRecord);
 }
 
+/** @brief Send a HIF_NOTIFY_SOCKET_STATE_CHANGE event to the GEOS guest. */
 void GeosHost_NotifySocketChange()
 {
-	// send event to GEOS client
 	static uint16_t eventRecord[6];
 	eventRecord[0] = HIF_EVENT_NOTIFICATION;
 	eventRecord[1] = HIF_NOTIFY_SOCKET_STATE_CHANGE;
@@ -964,11 +1230,24 @@ void GeosHost_NotifySocketChange()
 	GeosHost_SendEvent(eventRecord);
 }
 
+/* ----------------------------------------------------------------
+ * SSL/TLS handle table
+ *
+ * TLS contexts and sessions are stored in a flat handle table.
+ * Handles are 1-based (0 = invalid). associatedSocket[] maps each
+ * TLS handle to its underlying TCP socket index.
+ * ---------------------------------------------------------------- */
 #define MAX_HANDLES 20
 
-static void* handles[MAX_HANDLES];
-static uint16_t associatedSocket[MAX_HANDLES];
+static void* handles[MAX_HANDLES]; /**< TLS context/session pointers (index =
+                                      handle - 1) */
+static uint16_t associatedSocket[MAX_HANDLES]; /**< Socket index per TLS handle */
 
+/**
+ * @brief Allocate a handle table slot for a TLS context or session.
+ * @param ptr  Pointer to store (TLSContext*)
+ * @return 1-based handle, or 0 if the table is full
+ */
 static int AllocHandle(void* ptr)
 {
 
@@ -992,6 +1271,14 @@ uint16_t AsyncSSLConnect::RunAsync()
 	return 0;
 }
 
+/**
+ * @brief TLS certificate validation callback for tls_consume_stream().
+ *
+ * Checks validity dates, certificate chain integrity, and SNI subject match.
+ * Root CA chain validation is currently disabled (commented out).
+ *
+ * @return no_error on success, or a TLS error code on validation failure
+ */
 int validate_certificate(struct TLSContext* context,
                          struct TLSCertificate** certificate_chain, int len)
 {
@@ -1245,6 +1532,20 @@ uint16_t AsyncSSLRead::RunAsync()
 	return 0;
 }
 
+/**
+ * @brief Check whether a protected-mode segment selector is accessible.
+ *
+ * Validates null selector, LDT presence, descriptor existence, present bit,
+ * DPL/RPL privilege, and type (code/data for read, writable data for write).
+ * In real mode or VM86 mode, always returns true.
+ *
+ * Used by AsyncSSLRead::PollStatus() to avoid writing to guest memory
+ * when the target segment is not (yet) accessible.
+ *
+ * @param selector  Protected-mode segment selector
+ * @param isWrite   true if write access is required
+ * @return true if the segment is accessible with the requested permissions
+ */
 bool IsSegmentAccessible(uint16_t selector, bool isWrite = false)
 {
 	// Null selector
@@ -1354,6 +1655,16 @@ uint16_t AsyncSSLRead::PollStatus()
 	return 0;
 }
 
+/**
+ * @brief Create, initialize, and enqueue an async operation of type T.
+ *
+ * Template helper used by NetworkSubAPI and SSLSubAPI command handlers.
+ * Allocates a new AsyncOp subclass, calls Init() with G_commandBuffer,
+ * and either enqueues it (if pending) or deletes it (if completed
+ * synchronously or failed). Sets G_responseBuffer[0] and G_responseOffset.
+ *
+ * @tparam T  AsyncOp subclass (e.g. AsyncSocketConnect, AsyncSSLRead)
+ */
 template <typename T>
 static void DispatchAsyncOp()
 {
@@ -1374,8 +1685,14 @@ static void DispatchAsyncOp()
 
 // ============================================================
 // Sub-API HandleCommand implementations
+//
+// Each method handles the commands owned by its sub-API.
+// Parameters arrive in G_commandBuffer[]; results are placed
+// in G_responseBuffer[] with G_responseOffset set to 6 when
+// a response is ready.
 // ============================================================
 
+/** @brief Host sub-API: event interrupt vector and event queue management. */
 void HostSubAPI::HandleCommand(uint16_t cmd)
 {
 	switch (cmd) {
@@ -1400,6 +1717,7 @@ void HostSubAPI::HandleCommand(uint16_t cmd)
 	}
 }
 
+/** @brief Video sub-API: display mode changes and resolution/DPI queries. */
 void VideoSubAPI::HandleCommand(uint16_t cmd)
 {
 	switch (cmd) {
@@ -1448,6 +1766,8 @@ void VideoSubAPI::HandleCommand(uint16_t cmd)
 	}
 }
 
+/** @brief Networking sub-API: socket allocation, connect, send, recv,
+ * disconnect. */
 void NetworkSubAPI::HandleCommand(uint16_t cmd)
 {
 	switch (cmd) {
@@ -1627,6 +1947,7 @@ void NetworkSubAPI::HandleCommand(uint16_t cmd)
 	}
 }
 
+/** @brief SSL/TLS sub-API: context/session lifecycle, handshake, encrypted I/O. */
 void SSLSubAPI::HandleCommand(uint16_t cmd)
 {
 	switch (cmd) {
@@ -1729,8 +2050,20 @@ void SSLSubAPI::HandleCommand(uint16_t cmd)
 
 // ============================================================
 // I/O port command handler
+//
+// The guest writes 6 words sequentially to port 0x38FF.
+// On the 6th word, the command is fully assembled and dispatched:
+//   - HIF_CHECK_API is handled inline (needs cross-sub-API version query)
+//   - All other commands are routed to DispatchToSubAPI()
 // ============================================================
 
+/**
+ * @brief I/O port write handler — accumulates command words and dispatches.
+ *
+ * Each write appends one word to G_commandBuffer. When all 6 words are
+ * received, the command code in G_commandBuffer[0] is dispatched to the
+ * appropriate sub-API, or handled as a meta-command (HIF_CHECK_API).
+ */
 static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 {
 	if (G_commandOffset < (sizeof(G_commandBuffer) / sizeof(uint16_t))) {
@@ -1768,6 +2101,13 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 	}
 }
 
+/**
+ * @brief Initialize the GEOS host interface module.
+ *
+ * Sets up SDL3_net, registers the I/O port handlers, creates the event
+ * queue mutex, registers all sub-APIs (host, video, networking, SSL),
+ * and starts the timer tick handler.
+ */
 void GEOSHOST_Init()
 {
 
@@ -1794,6 +2134,7 @@ void GEOSHOST_Init()
 	LOG_INFO("GEOSHOST: Initialized");
 }
 
+/** @brief Shut down the GEOS host interface and release SDL3_net resources. */
 void GEOSHOST_Exit()
 {
 	LOG_INFO("GEOSHOST: Shutting down");
