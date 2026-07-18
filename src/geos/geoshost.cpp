@@ -362,6 +362,35 @@ AsyncOp* G_opRecords        = NULL;
 
 void GeosHost_NotifySocketChange();
 
+static uint32_t ResolveAddress(uint16_t segment, uint16_t offset)
+{
+	if (G_protectedOpMode) {
+		Descriptor desc;
+		cpu.gdt.GetDescriptor(segment, desc);
+		return static_cast<uint32_t>(desc.GetBase()) + offset;
+	} else {
+		return static_cast<uint32_t>(segment << 4) + offset;
+	}
+}
+
+static void ReadDosMemory(uint16_t segment, uint16_t offset, void* dest, int size)
+{
+	uint32_t addr = ResolveAddress(segment, offset);
+	uint8_t* buf  = static_cast<uint8_t*>(dest);
+	for (int i = 0; i < size; i++) {
+		buf[i] = mem_readb(addr + i);
+	}
+}
+
+static void WriteDosMemory(uint16_t segment, uint16_t offset, const void* src, int size)
+{
+	uint32_t addr      = ResolveAddress(segment, offset);
+	const uint8_t* buf = static_cast<const uint8_t*>(src);
+	for (int i = 0; i < size; i++) {
+		mem_writeb(addr + i, buf[i]);
+	}
+}
+
 static void PollSockets()
 {
 
@@ -488,25 +517,7 @@ uint16_t AsyncSocketSend::Init(uint16_t* cmdRec)
 
 		char* buffer = new char[size + 1];
 
-		if (G_protectedOpMode) {
-			Descriptor desc;
-			cpu.gdt.GetDescriptor(G_commandBuffer[2], desc);
-
-			uint32_t dosBuff = static_cast<uint32_t>(desc.GetBase()) +
-			                   G_commandBuffer[3];
-			for (int i = 0; i < size; i++) {
-				buffer[i] = mem_readb(dosBuff + i);
-			}
-
-		} else {
-
-			uint32_t dosBuff = static_cast<uint32_t>(
-			                           G_commandBuffer[2] << 4) +
-			                   G_commandBuffer[3];
-			for (int i = 0; i < size; i++) {
-				buffer[i] = mem_readb(dosBuff + i);
-			}
-		}
+		ReadDosMemory(G_commandBuffer[2], G_commandBuffer[3], buffer, size);
 		buffer[size] = 0;
 
 		bool result = NET_WriteToStreamSocket(sock.stream, buffer, size);
@@ -546,20 +557,7 @@ uint16_t AsyncSocketResolveAddr::Init(uint16_t* cmdRec)
 	// cx = address name len
 	LOG_MSG("\nAsyncSocketResolveAddr::Init: %x %x\n", cmdRec[1], cmdRec[2]);
 
-	if (G_protectedOpMode) {
-		Descriptor desc;
-		cpu.gdt.GetDescriptor(cmdRec[1], desc);
-		MEM_StrCopy(static_cast<uint32_t>(desc.GetBase()) + cmdRec[2],
-		            m_hostname,
-		            cmdRec[3]); // 1024 toasts the
-		                        // stack
-	} else {
-		MEM_StrCopy(static_cast<uint32_t>(cmdRec[1] << 4) + cmdRec[2],
-		            m_hostname,
-		            cmdRec[3]); // 1024 toasts the
-		                        // stack
-	}
-
+	MEM_StrCopy(ResolveAddress(cmdRec[1], cmdRec[2]), m_hostname, cmdRec[3]);
 	m_hostname[cmdRec[3]] = 0;
 
 	m_RunOwnThread = false;
@@ -986,35 +984,12 @@ uint16_t AsyncSSLWrite::Init(uint16_t* cmdRec)
 	m_ctx = reinterpret_cast<struct TLSContext*>(handles[handle - 1]);
 	m_socketHandle = associatedSocket[handle - 1];
 
-	// uint32_t dosBuff = static_cast<uint32_t>(G_commandBuffer[4] << 4) +
-	//                    G_commandBuffer[3];
 	int size = cmdRec[5];
 	LOG_MSG("NetSendData data size: %d", size);
 
 	char* buffer = new char[size + 1];
-	// for (int i = 0; i < size; i++) {
-	//	buffer[i] = mem_readb(dosBuff + i);
-	// }
-	// buffer[size] = 0;
 
-	if (G_protectedOpMode) {
-		Descriptor desc;
-		cpu.gdt.GetDescriptor(G_commandBuffer[4], desc);
-
-		uint32_t dosBuff = static_cast<uint32_t>(desc.GetBase()) +
-		                   G_commandBuffer[3];
-		for (int i = 0; i < size; i++) {
-			buffer[i] = mem_readb(dosBuff + i);
-		}
-
-	} else {
-
-		uint32_t dosBuff = static_cast<uint32_t>(G_commandBuffer[4] << 4) +
-		                   G_commandBuffer[3];
-		for (int i = 0; i < size; i++) {
-			buffer[i] = mem_readb(dosBuff + i);
-		}
-	}
+	ReadDosMemory(G_commandBuffer[4], G_commandBuffer[3], buffer, size);
 	buffer[size] = 0;
 
 	m_written = tls_write(m_ctx, (const unsigned char*)buffer, (unsigned int)size);
@@ -1164,25 +1139,7 @@ uint16_t AsyncSSLRead::PollStatus()
 		m_Result[0]           = HIF_OK;
 		m_Result[HIF_SLOT_DX] = read_size;
 
-		if (G_protectedOpMode) {
-
-			Descriptor desc;
-			cpu.gdt.GetDescriptor(m_BufferSegment, desc);
-
-			for (int i2 = 0; i2 < read_size; i2++) {
-				mem_writeb(static_cast<uint32_t>(desc.GetBase()) +
-				                   m_BufferOffset + i2,
-				           m_Buffer[i2]);
-			}
-
-		} else {
-
-			for (int i2 = 0; i2 < read_size; i2++) {
-				mem_writeb(static_cast<uint32_t>(m_BufferSegment << 4) +
-				                   m_BufferOffset + i2,
-				           m_Buffer[i2]);
-			}
-		}
+		WriteDosMemory(m_BufferSegment, m_BufferOffset, m_Buffer, read_size);
 
 	} else {
 		SocketState& sock = NetSockets[m_socketHandle];
@@ -1211,6 +1168,23 @@ uint16_t AsyncSSLRead::PollStatus()
 	}
 
 	return 0;
+}
+
+template <typename T>
+static void DispatchAsyncOp()
+{
+	AsyncOp* newOp = new T(G_opRecords);
+	if (newOp) {
+		G_responseBuffer[0] = newOp->Init(G_commandBuffer);
+		if ((G_responseBuffer[0] & 0xFF) != HIF_PENDING) {
+			delete newOp;
+		} else {
+			G_opRecords = newOp;
+		}
+	} else {
+		G_responseBuffer[0] = HIF_NO_MEMORY;
+	}
+	G_responseOffset = 6;
 }
 
 static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
@@ -1335,28 +1309,7 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				SDL_mutexV(G_eventQueueMutex);
 			} else if (G_commandBuffer[0] == HIF_NC_RESOLVE_ADDR) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSocketResolveAddr(G_opRecords);
-				if (newOp) {
-
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
+				DispatchAsyncOp<AsyncSocketResolveAddr>();
 
 			} else if (G_commandBuffer[0] == HIF_NC_ALLOC_CONNECTION) {
 
@@ -1411,53 +1364,11 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 			} else if (G_commandBuffer[0] == HIF_NC_CONNECT_REQUEST) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSocketConnect(G_opRecords);
-				if (newOp) {
-
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
+				DispatchAsyncOp<AsyncSocketConnect>();
 
 			} else if (G_commandBuffer[0] == HIF_NC_SEND_DATA) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSocketSend(G_opRecords);
-				if (newOp) {
-
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
+				DispatchAsyncOp<AsyncSocketSend>();
 
 			} else if (G_commandBuffer[0] == HIF_NC_RECV_NEXT_CLOSE) {
 
@@ -1558,40 +1469,12 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 								LOG_MSG("RECEIVENEXT: %x %x",
 								        G_commandBuffer[2],
 								        G_commandBuffer[3]);
-								if (G_protectedOpMode) {
-
-									Descriptor desc;
-									cpu.gdt.GetDescriptor(
-									        G_commandBuffer[2],
-									        desc);
-
-									for (int i2 = 0;
-									     i2 < size;
-									     i2++) {
-										mem_writeb(
-										        static_cast<uint32_t>(
-										                desc.GetBase()) +
-										                G_commandBuffer[3] +
-										                i2,
-										        NetSockets[i]
-										                .recvBuf[i2]);
-									}
-
-								} else {
-
-									for (int i2 = 0;
-									     i2 < size;
-									     i2++) {
-										mem_writeb(
-										        static_cast<uint32_t>(
-										                G_commandBuffer[2]
-										                << 4) +
-										                G_commandBuffer[3] +
-										                i2,
-										        NetSockets[i]
-										                .recvBuf[i2]);
-									}
-								}
+								WriteDosMemory(
+								        G_commandBuffer[2],
+								        G_commandBuffer[3],
+								        NetSockets[i]
+								                .recvBuf,
+								        size);
 
 								// mark unused,
 								// so continue
@@ -1723,21 +1606,10 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				                handles[handle - 1]);
 
 				// TODO check buffer size
-				if (G_protectedOpMode) {
-					Descriptor desc;
-					cpu.gdt.GetDescriptor(G_commandBuffer[HIF_SLOT_DX],
-					                      desc);
-					PhysPt dosBuff = desc.GetBase() +
-					                 G_commandBuffer[HIF_SLOT_CX];
-					MEM_StrCopy(dosBuff, host, reg_di); // 1024 toasts
-					                                    // the stack
-				} else {
-					PhysPt dosBuff = (G_commandBuffer[HIF_SLOT_DX]
-					                  << 4) +
-					                 G_commandBuffer[HIF_SLOT_CX];
-					MEM_StrCopy(dosBuff, host, reg_di); // 1024 toasts
-					                                    // the stack
-				}
+				MEM_StrCopy(ResolveAddress(G_commandBuffer[HIF_SLOT_DX],
+				                           G_commandBuffer[HIF_SLOT_CX]),
+				            host,
+				            reg_di);
 				host[G_commandBuffer[HIF_SLOT_DI]] = 0;
 
 				int result = tls_sni_set(ctx, host);
@@ -1749,78 +1621,16 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 
 			} else if (G_commandBuffer[0] == HIF_SSL_CONNECT) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSSLConnect(G_opRecords);
-				if (newOp) {
-
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
+				DispatchAsyncOp<AsyncSSLConnect>();
 
 			} else if (G_commandBuffer[0] == HIF_SSL_WRITE) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSSLWrite(G_opRecords);
-				if (newOp) {
-
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
+				DispatchAsyncOp<AsyncSSLWrite>();
 
 			} else if (G_commandBuffer[0] == HIF_SSL_READ) {
 
-				// allocate async op
-				AsyncOp* newOp = new AsyncSSLRead(G_opRecords);
-				if (newOp) {
+				DispatchAsyncOp<AsyncSSLRead>();
 
-					G_responseBuffer[0] = newOp->Init(
-					        G_commandBuffer);
-
-					if ((G_responseBuffer[0] & 0xFF) !=
-					    HIF_PENDING) {
-
-						delete newOp;
-
-					} else {
-
-						// add op to queue
-						G_opRecords = newOp;
-					}
-				} else {
-
-					G_responseBuffer[0] = HIF_NO_MEMORY;
-				}
-				G_responseOffset = 6;
 			} else if (G_commandBuffer[0] == HIF_SSL_CTX_FREE) {
 				int handle = G_commandBuffer[HIF_SLOT_SI];
 				tls_destroy_context(
