@@ -355,6 +355,225 @@ static void WriteDosMemory(uint16_t segment, uint16_t offset, const void* src, i
 	}
 }
 
+// ============================================================
+// Sub-API framework
+// ============================================================
+
+class GeosHostSubAPI {
+public:
+	virtual ~GeosHostSubAPI() {}
+	virtual uint8_t GetApiID() const                = 0;
+	virtual uint16_t GetVersion() const             = 0;
+	virtual bool HandlesCommand(uint16_t cmd) const = 0;
+	virtual void HandleCommand(uint16_t cmd)        = 0;
+
+	// For overlap checking at registration
+	virtual int GetCommandList(const uint16_t** outList) const
+	{
+		*outList = nullptr;
+		return 0;
+	}
+	virtual bool GetCommandRange(uint16_t& min, uint16_t& max) const
+	{
+		return false;
+	}
+};
+
+class RangeSubAPI : public GeosHostSubAPI {
+protected:
+	uint8_t m_apiID;
+	uint16_t m_version;
+	uint16_t m_rangeMin;
+	uint16_t m_rangeMax;
+
+public:
+	RangeSubAPI(uint8_t apiID, uint16_t version, uint16_t rangeMin,
+	            uint16_t rangeMax)
+	        : m_apiID(apiID),
+	          m_version(version),
+	          m_rangeMin(rangeMin),
+	          m_rangeMax(rangeMax)
+	{}
+
+	uint8_t GetApiID() const override
+	{
+		return m_apiID;
+	}
+	uint16_t GetVersion() const override
+	{
+		return m_version;
+	}
+	bool HandlesCommand(uint16_t cmd) const override
+	{
+		return cmd >= m_rangeMin && cmd <= m_rangeMax;
+	}
+	bool GetCommandRange(uint16_t& min, uint16_t& max) const override
+	{
+		min = m_rangeMin;
+		max = m_rangeMax;
+		return true;
+	}
+};
+
+class MappedSubAPI : public GeosHostSubAPI {
+protected:
+	uint8_t m_apiID;
+	uint16_t m_version;
+	const uint16_t* m_commands;
+	int m_commandCount;
+
+public:
+	MappedSubAPI(uint8_t apiID, uint16_t version, const uint16_t* commands,
+	             int count)
+	        : m_apiID(apiID),
+	          m_version(version),
+	          m_commands(commands),
+	          m_commandCount(count)
+	{}
+
+	uint8_t GetApiID() const override
+	{
+		return m_apiID;
+	}
+	uint16_t GetVersion() const override
+	{
+		return m_version;
+	}
+	bool HandlesCommand(uint16_t cmd) const override
+	{
+		for (int i = 0; i < m_commandCount; i++) {
+			if (m_commands[i] == cmd) {
+				return true;
+			}
+		}
+		return false;
+	}
+	int GetCommandList(const uint16_t** outList) const override
+	{
+		*outList = m_commands;
+		return m_commandCount;
+	}
+};
+
+// Concrete sub-API declarations
+
+static const uint16_t HostCommands[] = {HIF_SET_EVENT_INTERRUPT, HIF_GET_EVENT};
+
+class HostSubAPI : public MappedSubAPI {
+public:
+	HostSubAPI()
+	        : MappedSubAPI(HIF_API_HOST, 1, HostCommands,
+	                       sizeof(HostCommands) / sizeof(uint16_t))
+	{}
+	void HandleCommand(uint16_t cmd) override;
+};
+
+static const uint16_t VideoCommands[] = {HIF_SET_VIDEO_PARAMS, HIF_GET_VIDEO_PARAMS};
+
+class VideoSubAPI : public MappedSubAPI {
+public:
+	VideoSubAPI()
+	        : MappedSubAPI(HIF_API_VIDEO, 1, VideoCommands,
+	                       sizeof(VideoCommands) / sizeof(uint16_t))
+	{}
+	void HandleCommand(uint16_t cmd) override;
+};
+
+class NetworkSubAPI : public RangeSubAPI {
+public:
+	NetworkSubAPI()
+	        : RangeSubAPI(HIF_API_SOCKET, 2, HIF_NETWORKING_BASE, HIF_NETWORKING_END)
+	{}
+	void HandleCommand(uint16_t cmd) override;
+};
+
+class SSLSubAPI : public RangeSubAPI {
+public:
+	SSLSubAPI() : RangeSubAPI(HIF_API_SSL, 1, HIF_SSL_BASE, HIF_SSL_END) {}
+	void HandleCommand(uint16_t cmd) override;
+};
+
+// ============================================================
+// Sub-API dispatcher
+// ============================================================
+
+#define MAX_SUB_APIS 8
+
+static GeosHostSubAPI* G_subAPIs[MAX_SUB_APIS];
+static int G_subAPICount = 0;
+
+static bool CheckOverlap(const GeosHostSubAPI* a, const GeosHostSubAPI* b)
+{
+	// Check a's mapped commands against b
+	const uint16_t* cmds;
+	int count = a->GetCommandList(&cmds);
+	for (int i = 0; i < count; i++) {
+		if (b->HandlesCommand(cmds[i])) {
+			return true;
+		}
+	}
+
+	// Check b's mapped commands against a
+	count = b->GetCommandList(&cmds);
+	for (int i = 0; i < count; i++) {
+		if (a->HandlesCommand(cmds[i])) {
+			return true;
+		}
+	}
+
+	// Range vs range intersection
+	uint16_t aMin, aMax, bMin, bMax;
+	if (a->GetCommandRange(aMin, aMax) && b->GetCommandRange(bMin, bMax)) {
+		return aMin <= bMax && bMin <= aMax;
+	}
+
+	return false;
+}
+
+static bool RegisterSubAPI(GeosHostSubAPI* api)
+{
+	if (G_subAPICount >= MAX_SUB_APIS) {
+		LOG_WARNING("GEOSHOST: Sub-API table full");
+		return false;
+	}
+
+	for (int i = 0; i < G_subAPICount; i++) {
+		if (CheckOverlap(api, G_subAPIs[i])) {
+			LOG_WARNING("GEOSHOST: Sub-API %d command overlap with sub-API %d",
+			            api->GetApiID(),
+			            G_subAPIs[i]->GetApiID());
+			return false;
+		}
+	}
+
+	G_subAPIs[G_subAPICount++] = api;
+	LOG_INFO("GEOSHOST: Registered sub-API %d (version %d)",
+	         api->GetApiID(),
+	         api->GetVersion());
+	return true;
+}
+
+static uint16_t GetSubAPIVersion(uint8_t apiID)
+{
+	for (int i = 0; i < G_subAPICount; i++) {
+		if (G_subAPIs[i]->GetApiID() == apiID) {
+			return G_subAPIs[i]->GetVersion();
+		}
+	}
+	return 0;
+}
+
+static bool DispatchToSubAPI(uint16_t cmd)
+{
+	for (int i = 0; i < G_subAPICount; i++) {
+		if (G_subAPIs[i]->HandlesCommand(cmd)) {
+			G_subAPIs[i]->HandleCommand(cmd);
+			return true;
+		}
+	}
+	return false;
+}
+
 static void PollSockets()
 {
 
@@ -1153,42 +1372,375 @@ static void DispatchAsyncOp()
 	G_responseOffset = 6;
 }
 
+// ============================================================
+// Sub-API HandleCommand implementations
+// ============================================================
+
+void HostSubAPI::HandleCommand(uint16_t cmd)
+{
+	switch (cmd) {
+	case HIF_SET_EVENT_INTERRUPT:
+		G_protectedOpMode = cpu.pmode;
+		G_eventInterrupt  = 0xA0 /* G_commandBuffer[1] & 0xFF*/;
+		break;
+
+	case HIF_GET_EVENT:
+		SDL_mutexP(G_eventQueueMutex);
+		if (G_eventRecords == NULL) {
+			G_responseBuffer[0] = HIF_NOT_FOUND;
+		} else {
+			EventRecord* thisRecord = G_eventRecords;
+			thisRecord->GetRecordData(G_responseBuffer);
+			G_eventRecords = thisRecord->GetNext();
+			delete thisRecord;
+		}
+		G_responseOffset = 6;
+		SDL_mutexV(G_eventQueueMutex);
+		break;
+	}
+}
+
+void VideoSubAPI::HandleCommand(uint16_t cmd)
+{
+	switch (cmd) {
+	case HIF_SET_VIDEO_PARAMS: {
+		MOUSEDOS_BeforeNewVideoMode();
+		uint16_t newWidth  = G_commandBuffer[1];
+		uint16_t newHeight = G_commandBuffer[2];
+		VESA_SetBaseboxMode(newWidth, newHeight);
+		LOG_INFO("GEOSHOST: Set video mode %dx%d", newWidth, newHeight);
+		MOUSEDOS_AfterNewVideoMode(false);
+
+		G_responseBuffer[0] = HIF_OK;
+		G_responseBuffer[2] = 0x89A;
+		G_responseOffset    = 6;
+		break;
+	}
+
+	case HIF_GET_VIDEO_PARAMS: {
+		float ddpi, hdpi, vdpi;
+
+		int displayIndex = SDL_GetWindowDisplayIndex(GFX_GetWindow());
+
+		int width, height;
+		SDL_GL_GetDrawableSize(GFX_GetWindow(), &width, &height);
+
+		G_responseBuffer[0] = HIF_OK;
+		G_responseBuffer[1] = width;
+		G_responseBuffer[2] = height;
+
+		if (SDL_GetDisplayDPI(displayIndex, &ddpi, &hdpi, &vdpi) == 0) {
+			G_responseBuffer[3] = hdpi;
+			G_responseBuffer[4] = vdpi;
+		} else {
+			G_responseBuffer[3] = 0;
+			G_responseBuffer[4] = 0;
+		}
+		GH_DBG("Display resolution: %dx%d dpi=%dx%d",
+		       width,
+		       height,
+		       G_responseBuffer[3],
+		       G_responseBuffer[4]);
+		G_responseBuffer[5] = 0;
+		G_responseOffset    = 6;
+		break;
+	}
+	}
+}
+
+void NetworkSubAPI::HandleCommand(uint16_t cmd)
+{
+	switch (cmd) {
+	case HIF_NC_RESOLVE_ADDR:
+		DispatchAsyncOp<AsyncSocketResolveAddr>();
+		break;
+
+	case HIF_NC_ALLOC_CONNECTION: {
+		int socketHandle = -1;
+
+		int i = G_lookupNext;
+		do {
+			if (!NetSockets[i].used) {
+				socketHandle = i;
+				break;
+			}
+			i++;
+			if (i == MaxSockets) {
+				i = 1;
+			}
+		} while (i != G_lookupNext);
+
+		if (socketHandle != -1) {
+			G_lookupNext = i + 1;
+			if (G_lookupNext >= MaxSockets) {
+				G_lookupNext = 1;
+			}
+		}
+
+		if (socketHandle < 0) {
+			LOG_WARNING("GEOSHOST: No free sockets");
+			G_responseBuffer[0] = HIF_TABLE_FULL;
+			return;
+		}
+
+		LOG_INFO("GEOSHOST: Allocated socket %d", socketHandle);
+		SocketState& sock = NetSockets[socketHandle];
+
+		sock.used          = true;
+		sock.done          = false;
+		sock.open          = false;
+		sock.blocking      = false;
+		sock.ssl           = false;
+		sock.sslInitialEnd = false;
+		sock.receiveDone   = false;
+		sock.sendDone      = false;
+
+		G_responseBuffer[0] = HIF_OK;
+		G_responseBuffer[1] = (uint16_t)socketHandle;
+		G_responseOffset    = 6;
+		break;
+	}
+
+	case HIF_NC_CONNECT_REQUEST:
+		DispatchAsyncOp<AsyncSocketConnect>();
+		break;
+
+	case HIF_NC_SEND_DATA: DispatchAsyncOp<AsyncSocketSend>(); break;
+
+	case HIF_NC_RECV_NEXT_CLOSE: {
+		G_responseBuffer[0] = HIF_OK;
+		for (int i = 0; i < MaxSockets; i++) {
+			if (NetSockets[i].used && !NetSockets[i].done) {
+				if (NetSockets[i].receiveDone) {
+					NetSockets[i].done  = true;
+					G_responseBuffer[1] = i;
+					G_responseBuffer[2] = NetSockets[i].sendDone
+					                            ? 0xFFFF
+					                            : 0;
+					if (i > 0) {
+						GH_DBG("RecvNextClosed: socket=%d sendDone=%x",
+						       i,
+						       G_responseBuffer[2]);
+					}
+					G_responseOffset = 6;
+
+					if (NetSockets[i].sendDone) {
+						NetSockets[i].used = false;
+					}
+					return;
+				}
+			}
+		}
+		G_responseBuffer[1] = 0;
+		G_responseOffset    = 6;
+		break;
+	}
+
+	case HIF_NC_NEXT_RECV_SIZE: {
+		G_responseBuffer[0] = HIF_OK;
+		G_responseBuffer[1] = 0;
+
+		for (int i = 0; i < MaxSockets; i++) {
+			if (NetSockets[i].used && !NetSockets[i].done) {
+				if (NetSockets[i].recvBufUsed > 0) {
+					G_responseBuffer[1] = NetSockets[i].recvBufUsed;
+					G_responseBuffer[2] = i;
+					break;
+				}
+			}
+		}
+		if (G_responseBuffer[1] > 0) {
+			GH_DBG("NextRecvSize: %d bytes on socket %d",
+			       G_responseBuffer[1],
+			       G_responseBuffer[2]);
+		}
+		G_responseOffset = 6;
+		break;
+	}
+
+	case HIF_NC_RECV_NEXT: {
+		for (int i = 0; i < MaxSockets; i++) {
+			if (NetSockets[i].used && !NetSockets[i].done) {
+				GH_DBG("RecvNext: socket=%u bufUsed=%d expected=%d",
+				       i,
+				       NetSockets[i].recvBufUsed,
+				       G_commandBuffer[1]);
+
+				if (NetSockets[i].recvBufUsed == G_commandBuffer[1]) {
+					int size = G_commandBuffer[1];
+
+					GH_DBG("RecvNext: copying %d bytes to %x:%x",
+					       size,
+					       G_commandBuffer[2],
+					       G_commandBuffer[3]);
+					WriteDosMemory(G_commandBuffer[2],
+					               G_commandBuffer[3],
+					               NetSockets[i].recvBuf,
+					               size);
+
+					NetSockets[i].recvBufUsed = 0;
+					G_responseBuffer[1]       = i;
+					break;
+				}
+			}
+			G_responseOffset = 6;
+		}
+		break;
+	}
+
+	case HIF_NC_DISCONNECT: {
+		LOG_INFO("GEOSHOST: Disconnect socket=%d full=%d",
+		         G_commandBuffer[1],
+		         G_commandBuffer[2]);
+		SocketState& sock = NetSockets[G_commandBuffer[1]];
+
+		if (sock.used) {
+			sock.sendDone = true;
+			if (sock.stream) {
+				NET_DestroyStreamSocket(sock.stream);
+				sock.stream      = NULL;
+				sock.receiveDone = true;
+				sock.done        = false;
+			}
+
+			if (G_commandBuffer[2]) {
+				sock.used = false;
+				sock.done = true;
+			}
+		}
+		G_responseBuffer[0] = HIF_OK;
+		G_responseOffset    = 6;
+		break;
+	}
+
+	case HIF_NC_CONNECTED: {
+		LOG_INFO("GEOSHOST: Socket %d marked connected", G_commandBuffer[1]);
+		SocketState& sock = NetSockets[G_commandBuffer[1]];
+
+		if (sock.used) {
+			sock.open = true;
+		}
+		G_responseBuffer[0] = HIF_OK;
+		G_responseOffset    = 6;
+		break;
+	}
+	}
+}
+
+void SSLSubAPI::HandleCommand(uint16_t cmd)
+{
+	switch (cmd) {
+	case HIF_SSL_CTX_NEW: {
+		int method = 0;
+		int handle = AllocHandle(tls_create_context(method, TLS_V12));
+
+		GH_DBG("SSL_CTX_NEW: handle=%x", handle);
+		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
+		G_responseBuffer[HIF_SLOT_DX] = handle & 0xFFFF;
+		G_responseOffset              = 6;
+		break;
+	}
+
+	case HIF_SSL_NEW: {
+		int handle = G_commandBuffer[HIF_SLOT_SI];
+
+		struct TLSContext* context = reinterpret_cast<struct TLSContext*>(
+		        handles[handle - 1]);
+
+		GH_DBG("SSL_NEW: ctx_handle=%d context=%p", handle, context);
+
+		int method = 0;
+		struct TLSContext* context2 = tls_create_context(method, TLS_V12);
+		int newHandle = AllocHandle(context2);
+
+		GH_DBG("SSL_NEW: ssl_handle=%d", newHandle);
+		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
+		G_responseBuffer[HIF_SLOT_DX] = newHandle & 0xFFFF;
+		G_responseOffset              = 6;
+		break;
+	}
+
+	case HIF_SSL_SET_SSL_METHOD:
+		G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
+		G_responseBuffer[HIF_SLOT_DX] = 0;
+		G_responseOffset              = 6;
+		break;
+
+	case HIF_SSL_SET_FD: {
+		int handle = G_commandBuffer[HIF_SLOT_SI];
+		int socket = G_commandBuffer[HIF_SLOT_DI];
+		GH_DBG("SSL_SET_FD: handle=%x socket=%x", handle, socket);
+		associatedSocket[handle - 1] = socket;
+
+		NetSockets[socket].ssl = true;
+
+		G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
+		G_responseBuffer[HIF_SLOT_DX] = 0;
+		G_responseOffset              = 6;
+		break;
+	}
+
+	case HIF_SSL_SET_TLSEXT_HOST_NAME: {
+		char host[256];
+
+		int handle = G_commandBuffer[HIF_SLOT_SI];
+
+		struct TLSContext* ctx = reinterpret_cast<struct TLSContext*>(
+		        handles[handle - 1]);
+
+		// TODO check buffer size
+		MEM_StrCopy(ResolveAddress(G_commandBuffer[HIF_SLOT_DX],
+		                           G_commandBuffer[HIF_SLOT_CX]),
+		            host,
+		            reg_di);
+		host[G_commandBuffer[HIF_SLOT_DI]] = 0;
+
+		LOG_INFO("GEOSHOST: SNI hostname set: %s (handle=%x)", host, handle);
+		tls_sni_set(ctx, host);
+
+		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
+		G_responseBuffer[HIF_SLOT_DX] = 0;
+		break;
+	}
+
+	case HIF_SSL_CONNECT: DispatchAsyncOp<AsyncSSLConnect>(); break;
+
+	case HIF_SSL_WRITE: DispatchAsyncOp<AsyncSSLWrite>(); break;
+
+	case HIF_SSL_READ: DispatchAsyncOp<AsyncSSLRead>(); break;
+
+	case HIF_SSL_CTX_FREE: {
+		int handle = G_commandBuffer[HIF_SLOT_SI];
+		tls_destroy_context((struct TLSContext*)handles[handle - 1]);
+		handles[handle - 1]           = NULL;
+		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
+		break;
+	}
+
+	case HIF_SSL_FREE: {
+		int handle = G_commandBuffer[HIF_SLOT_SI];
+		tls_destroy_context((struct TLSContext*)handles[handle - 1]);
+		handles[handle - 1]           = NULL;
+		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
+		break;
+	}
+	}
+}
+
+// ============================================================
+// I/O port command handler
+// ============================================================
+
 static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 {
-	// we receive command bytes on this io port, works like a
-	// interrupt but keeps the overall processor state
-	//
-	// parameters are fetched from register contents as needed
-	// result are fed into registers as well, depending on the command
-	// potentially referenced memory is read or written
-
 	if (G_commandOffset < (sizeof(G_commandBuffer) / sizeof(uint16_t))) {
 		G_commandBuffer[G_commandOffset] = (uint16_t)command;
 		G_commandOffset++;
 
 		if (G_commandOffset == (sizeof(G_commandBuffer) / sizeof(uint16_t))) {
-			switch (G_commandBuffer[0]) {
 
-			case HIF_SET_VIDEO_PARAMS: {
-				MOUSEDOS_BeforeNewVideoMode();
-				uint16_t newWidth  = G_commandBuffer[1];
-				uint16_t newHeight = G_commandBuffer[2];
-				VESA_SetBaseboxMode(newWidth, newHeight);
-				LOG_INFO("GEOSHOST: Set video mode %dx%d",
-				         newWidth,
-				         newHeight);
-				MOUSEDOS_AfterNewVideoMode(false);
-
-				G_responseBuffer[0] = HIF_OK;
-				G_responseBuffer[2] = 0x89A;
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_CHECK_API: {
-				uint16_t resultVersion = 0;
-
-				/* full response buffer */
+			if (G_commandBuffer[0] == HIF_CHECK_API) {
+				// Meta-command: query sub-API versions
 				G_responseBuffer[0] = HIF_OK;
 				G_responseBuffer[1] = (((uint16_t)G_baseboxID[1])
 				                       << 8) |
@@ -1202,375 +1754,15 @@ static void write_baseboxcmd(io_port_t, io_val_t command, io_width_t)
 				G_responseBuffer[4] = (((uint16_t)G_baseboxID[7])
 				                       << 8) |
 				                      G_baseboxID[6];
-
-				/* Return API specific version, 0 if API is not
-				 * supported */
-				switch (G_commandBuffer[1]) {
-				case HIF_API_HOST: resultVersion = 1; break;
-				case HIF_API_VIDEO: resultVersion = 1; break;
-				case HIF_API_SOCKET: resultVersion = 2; break;
-				case HIF_API_SSL: resultVersion = 1; break;
-				default: resultVersion = 0; break;
-				}
-				G_responseBuffer[5] = resultVersion;
+				G_responseBuffer[5] = GetSubAPIVersion(
+				        G_commandBuffer[1]);
 				LOG_INFO("GEOSHOST: API check: api=%d version=%d",
 				         G_commandBuffer[1],
-				         resultVersion);
+				         G_responseBuffer[5]);
 				G_responseOffset = 6;
-				break;
-			}
-
-			case HIF_SET_EVENT_INTERRUPT:
-				G_protectedOpMode = cpu.pmode;
-				G_eventInterrupt =
-				        0xA0 /* G_commandBuffer[1] & 0xFF*/;
-				break;
-
-			case HIF_GET_VIDEO_PARAMS: {
-				float ddpi, hdpi, vdpi;
-
-				int displayIndex = SDL_GetWindowDisplayIndex(
-				        GFX_GetWindow());
-
-				int width, height;
-				SDL_GL_GetDrawableSize(GFX_GetWindow(), &width, &height);
-
-				G_responseBuffer[0] = HIF_OK;
-				G_responseBuffer[1] = width;  /* native width */
-				G_responseBuffer[2] = height; /* native height */
-
-				if (SDL_GetDisplayDPI(displayIndex, &ddpi, &hdpi, &vdpi) ==
-				    0) {
-					G_responseBuffer[3] = hdpi; /* horizontal
-					                               dpi */
-					G_responseBuffer[4] = vdpi; /* vertical
-					                               dpi */
-				} else {
-					G_responseBuffer[3] = 0;
-					G_responseBuffer[4] = 0;
-				}
-				GH_DBG("Display resolution: %dx%d dpi=%dx%d",
-				       width,
-				       height,
-				       G_responseBuffer[3],
-				       G_responseBuffer[4]);
-				G_responseBuffer[5] = 0; /* unused */
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_GET_EVENT:
-				SDL_mutexP(G_eventQueueMutex);
-				if (G_eventRecords == NULL) {
-					G_responseBuffer[0] = HIF_NOT_FOUND;
-				} else {
-					EventRecord* thisRecord = G_eventRecords;
-					thisRecord->GetRecordData(G_responseBuffer);
-					G_eventRecords = thisRecord->GetNext();
-					delete thisRecord;
-				}
-				G_responseOffset = 6;
-				SDL_mutexV(G_eventQueueMutex);
-				break;
-
-			case HIF_NC_RESOLVE_ADDR:
-				DispatchAsyncOp<AsyncSocketResolveAddr>();
-				break;
-
-			case HIF_NC_ALLOC_CONNECTION: {
-				int socketHandle = -1;
-
-				int i = G_lookupNext;
-				do {
-					if (!NetSockets[i].used) {
-						socketHandle = i;
-						break;
-					}
-					i++;
-					if (i == MaxSockets) {
-						i = 1;
-					}
-				} while (i != G_lookupNext);
-
-				if (socketHandle != -1) {
-					G_lookupNext = i + 1;
-					if (G_lookupNext >= MaxSockets) {
-						G_lookupNext = 1;
-					}
-				}
-
-				if (socketHandle < 0) {
-					LOG_WARNING("GEOSHOST: No free sockets");
-					G_responseBuffer[0] = HIF_TABLE_FULL;
-					return;
-				}
-
-				LOG_INFO("GEOSHOST: Allocated socket %d",
-				         socketHandle);
-				SocketState& sock = NetSockets[socketHandle];
-
-				sock.used          = true;
-				sock.done          = false;
-				sock.open          = false;
-				sock.blocking      = false;
-				sock.ssl           = false;
-				sock.sslInitialEnd = false;
-				sock.receiveDone   = false;
-				sock.sendDone      = false;
-
-				G_responseBuffer[0] = HIF_OK;
-				G_responseBuffer[1] = (uint16_t)socketHandle;
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_NC_CONNECT_REQUEST:
-				DispatchAsyncOp<AsyncSocketConnect>();
-				break;
-
-			case HIF_NC_SEND_DATA:
-				DispatchAsyncOp<AsyncSocketSend>();
-				break;
-
-			case HIF_NC_RECV_NEXT_CLOSE: {
-				G_responseBuffer[0] = HIF_OK;
-				for (int i = 0; i < MaxSockets; i++) {
-					if (NetSockets[i].used && !NetSockets[i].done) {
-						if (NetSockets[i].receiveDone) {
-							NetSockets[i].done = true;
-							G_responseBuffer[1] = i;
-							G_responseBuffer[2] =
-							        NetSockets[i].sendDone
-							                ? 0xFFFF
-							                : 0;
-							if (i > 0) {
-								GH_DBG("RecvNextClosed: socket=%d sendDone=%x",
-								       i,
-								       G_responseBuffer[2]);
-							}
-							G_responseOffset = 6;
-
-							if (NetSockets[i].sendDone) {
-								NetSockets[i].used = false;
-							}
-							return;
-						}
-					}
-				}
-				G_responseBuffer[1] = 0;
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_NC_NEXT_RECV_SIZE: {
-				G_responseBuffer[0] = HIF_OK;
-				G_responseBuffer[1] = 0;
-
-				for (int i = 0; i < MaxSockets; i++) {
-					if (NetSockets[i].used && !NetSockets[i].done) {
-						if (NetSockets[i].recvBufUsed > 0) {
-							G_responseBuffer[1] =
-							        NetSockets[i].recvBufUsed;
-							G_responseBuffer[2] = i;
-							break;
-						}
-					}
-				}
-				if (G_responseBuffer[1] > 0) {
-					GH_DBG("NextRecvSize: %d bytes on socket %d",
-					       G_responseBuffer[1],
-					       G_responseBuffer[2]);
-				}
-				G_responseOffset = 6;
-				break;
-			}
-
-			case HIF_NC_RECV_NEXT: {
-				for (int i = 0; i < MaxSockets; i++) {
-					if (NetSockets[i].used && !NetSockets[i].done) {
-						GH_DBG("RecvNext: socket=%u bufUsed=%d expected=%d",
-						       i,
-						       NetSockets[i].recvBufUsed,
-						       G_commandBuffer[1]);
-
-						if (NetSockets[i].recvBufUsed ==
-						    G_commandBuffer[1]) {
-							int size = G_commandBuffer[1];
-
-							GH_DBG("RecvNext: copying %d bytes to %x:%x",
-							       size,
-							       G_commandBuffer[2],
-							       G_commandBuffer[3]);
-							WriteDosMemory(
-							        G_commandBuffer[2],
-							        G_commandBuffer[3],
-							        NetSockets[i].recvBuf,
-							        size);
-
-							NetSockets[i].recvBufUsed = 0;
-							G_responseBuffer[1] = i;
-							break;
-						}
-					}
-					G_responseOffset = 6;
-				}
-				break;
-			}
-
-			case HIF_NC_DISCONNECT: {
-				LOG_INFO("GEOSHOST: Disconnect socket=%d full=%d",
-				         G_commandBuffer[1],
-				         G_commandBuffer[2]);
-				SocketState& sock = NetSockets[G_commandBuffer[1]];
-
-				if (sock.used) {
-					sock.sendDone = true;
-					if (sock.stream) {
-						NET_DestroyStreamSocket(sock.stream);
-						sock.stream      = NULL;
-						sock.receiveDone = true;
-						sock.done        = false;
-					}
-
-					if (G_commandBuffer[2]) {
-						// full close
-						sock.used = false;
-						sock.done = true;
-					}
-				}
-				G_responseBuffer[0] = HIF_OK;
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_NC_CONNECTED: {
-				LOG_INFO("GEOSHOST: Socket %d marked connected",
-				         G_commandBuffer[1]);
-				SocketState& sock = NetSockets[G_commandBuffer[1]];
-
-				if (sock.used) {
-					sock.open = true;
-				}
-				G_responseBuffer[0] = HIF_OK;
-				G_responseOffset    = 6;
-				break;
-			}
-
-			case HIF_SSL_CTX_NEW: {
-				int method = 0; // client method
-				int handle = AllocHandle(
-				        tls_create_context(method, TLS_V12));
-
-				GH_DBG("SSL_CTX_NEW: handle=%x", handle);
-				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-				G_responseBuffer[HIF_SLOT_DX] = handle & 0xFFFF;
-				G_responseOffset              = 6;
-				break;
-			}
-
-			case HIF_SSL_NEW: {
-				int handle = G_commandBuffer[HIF_SLOT_SI];
-
-				struct TLSContext* context =
-				        reinterpret_cast<struct TLSContext*>(
-				                handles[handle - 1]);
-
-				GH_DBG("SSL_NEW: ctx_handle=%d context=%p",
-				       handle,
-				       context);
-
-				int method = 0; // client method
-				struct TLSContext* context2 =
-				        tls_create_context(method, TLS_V12);
-				int newHandle = AllocHandle(context2);
-
-				GH_DBG("SSL_NEW: ssl_handle=%d", newHandle);
-				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-				G_responseBuffer[HIF_SLOT_DX] = newHandle & 0xFFFF;
-				G_responseOffset = 6;
-				break;
-			}
-
-			case HIF_SSL_SET_SSL_METHOD:
-				G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
-				G_responseBuffer[HIF_SLOT_DX] = 0;
-				G_responseOffset              = 6;
-				break;
-
-			case HIF_SSL_SET_FD: {
-				int handle = G_commandBuffer[HIF_SLOT_SI];
-				int socket = G_commandBuffer[HIF_SLOT_DI];
-				GH_DBG("SSL_SET_FD: handle=%x socket=%x", handle, socket);
-				associatedSocket[handle - 1] = socket;
-
-				NetSockets[socket].ssl = true;
-
-				G_responseBuffer[HIF_SLOT_AX] = HIF_FAILED;
-				G_responseBuffer[HIF_SLOT_DX] = 0;
-				G_responseOffset              = 6;
-				break;
-			}
-
-			case HIF_SSL_SET_TLSEXT_HOST_NAME: {
-				char host[256];
-
-				int handle = G_commandBuffer[HIF_SLOT_SI];
-
-				struct TLSContext* ctx =
-				        reinterpret_cast<struct TLSContext*>(
-				                handles[handle - 1]);
-
-				// TODO check buffer size
-				MEM_StrCopy(ResolveAddress(G_commandBuffer[HIF_SLOT_DX],
-				                           G_commandBuffer[HIF_SLOT_CX]),
-				            host,
-				            reg_di);
-				host[G_commandBuffer[HIF_SLOT_DI]] = 0;
-
-				LOG_INFO("GEOSHOST: SNI hostname set: %s (handle=%x)",
-				         host,
-				         handle);
-				tls_sni_set(ctx, host);
-
-				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-				G_responseBuffer[HIF_SLOT_DX] = 0;
-				break;
-			}
-
-			case HIF_SSL_CONNECT:
-				DispatchAsyncOp<AsyncSSLConnect>();
-				break;
-
-			case HIF_SSL_WRITE:
-				DispatchAsyncOp<AsyncSSLWrite>();
-				break;
-
-			case HIF_SSL_READ:
-				DispatchAsyncOp<AsyncSSLRead>();
-				break;
-
-			case HIF_SSL_CTX_FREE: {
-				int handle = G_commandBuffer[HIF_SLOT_SI];
-				tls_destroy_context(
-				        (struct TLSContext*)handles[handle - 1]);
-				handles[handle - 1]           = NULL;
-				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-				break;
-			}
-
-			case HIF_SSL_FREE: {
-				int handle = G_commandBuffer[HIF_SLOT_SI];
-				tls_destroy_context(
-				        (struct TLSContext*)handles[handle - 1]);
-				handles[handle - 1]           = NULL;
-				G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-				break;
-			}
-
-			default:
+			} else if (!DispatchToSubAPI(G_commandBuffer[0])) {
 				LOG_WARNING("GEOSHOST: Unhandled request code: %d",
 				            G_commandBuffer[0]);
-				break;
 			}
 		}
 	}
@@ -1585,6 +1777,17 @@ void GEOSHOST_Init()
 	IO_RegisterWriteHandler(0x38FF, write_baseboxcmd, io_width_t::word);
 
 	G_eventQueueMutex = SDL_CreateMutex();
+
+	// Register sub-APIs
+	static HostSubAPI hostAPI;
+	static VideoSubAPI videoAPI;
+	static NetworkSubAPI networkAPI;
+	static SSLSubAPI sslAPI;
+
+	RegisterSubAPI(&hostAPI);
+	RegisterSubAPI(&videoAPI);
+	RegisterSubAPI(&networkAPI);
+	RegisterSubAPI(&sslAPI);
 
 	TIMER_AddTickHandler(GeosHost_TickHandler);
 
