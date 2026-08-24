@@ -50,7 +50,7 @@
  * handshake steps, buffer details, socket polling, recv/send sizes).
  * In normal builds these compile to nothing.
  * ---------------------------------------------------------------- */
-#define GEOSHOST_DEBUG 0
+#define GEOSHOST_DEBUG 1
 
 #if GEOSHOST_DEBUG
 #define GH_DBG(fmt, ...) LOG_MSG("GEOSHOST: " fmt, ##__VA_ARGS__)
@@ -1310,9 +1310,12 @@ int validate_certificate(struct TLSContext* context,
 		}
 	}
 
-	// err = tls_certificate_chain_is_valid_root(context, certificate_chain,
-	// len); if (err) { 	return err;
-	// }
+	GH_DBG("Certificate validation start");
+
+	err = tls_certificate_chain_is_valid_root(context, certificate_chain, len); 
+	if (err) { 	
+		return err;
+	}
 
 	GH_DBG("Certificate validation OK");
 
@@ -1739,6 +1742,9 @@ void VideoSubAPI::HandleCommand(uint16_t cmd)
 		float ddpi, hdpi, vdpi;
 
 		int displayIndex = SDL_GetWindowDisplayIndex(GFX_GetWindow());
+		if (displayIndex < 0) {
+			displayIndex = 0;	// use main display in case of error
+		}
 
 		int width, height;
 		SDL_GL_GetDrawableSize(GFX_GetWindow(), &width, &height);
@@ -1751,8 +1757,8 @@ void VideoSubAPI::HandleCommand(uint16_t cmd)
 			G_responseBuffer[3] = hdpi;
 			G_responseBuffer[4] = vdpi;
 		} else {
-			G_responseBuffer[3] = 0;
-			G_responseBuffer[4] = 0;
+			G_responseBuffer[3] = 96;
+			G_responseBuffer[4] = 96;
 		}
 		GH_DBG("Display resolution: %dx%d dpi=%dx%d",
 		       width,
@@ -1972,11 +1978,19 @@ void SSLSubAPI::HandleCommand(uint16_t cmd)
 
 		int method = 0;
 		struct TLSContext* context2 = tls_create_context(method, TLS_V12);
+
+		int res = tls_load_root_certificates(
+		        context2,
+		        reinterpret_cast<const unsigned char*>(ROOT_CA_DEF),
+		        ROOT_CA_DEF_LEN);
+		LOG_INFO("GEOSHOST: Socket %d load certificate %d",
+		         G_commandBuffer[1],
+		         res);
 		int newHandle = AllocHandle(context2);
 
 		GH_DBG("SSL_NEW: ssl_handle=%d", newHandle);
-		G_responseBuffer[HIF_SLOT_AX] = HIF_OK;
-		G_responseBuffer[HIF_SLOT_DX] = newHandle & 0xFFFF;
+		G_responseBuffer[HIF_SLOT_AX] = (res > 0) ? HIF_OK : HIF_FAILED ;
+		G_responseBuffer[HIF_SLOT_DX] = (res > 0) ? (newHandle & 0xFFFF) : 0;
 		G_responseOffset              = 6;
 		break;
 	}
