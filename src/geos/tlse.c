@@ -1440,7 +1440,16 @@ static const unsigned int issurer_id[] = {1, 1, 4, 0};
 static const unsigned int owner_id[] = {1, 1, 6, 0};
 static const unsigned int validity_id[] = {1, 1, 5, 0};
 static const unsigned int algorithm_id[] = {1, 1, 3, 0};
-static const unsigned int sign_id[] = {1, 3, 2, 1, 0};
+// FIX: was {1, 3, 2, 1, 0}. fields[] is shared across recursion levels and is
+// never cleared, so the trailing "2, 1" matched stale values left over from the
+// signatureAlgorithm AlgorithmIdentifier. That only works for RSA, whose
+// AlgorithmIdentifier is SEQUENCE { OID, NULL } (2 elements -> fields[2] == 2).
+// ECDSA/EdDSA omit the parameters field (RFC 5758), leaving fields[2] == 1, so
+// the signature was never extracted and cert->sign_key stayed NULL.
+// The signatureValue is unambiguously element 3 of the Certificate SEQUENCE;
+// the deeper indices carry no information. The call site additionally pins
+// level == 2.
+static const unsigned int sign_id[] = {1, 3, 0};
 static const unsigned int priv_id[] = {1, 4, 0};
 static const unsigned int priv_der_id[] = {1, 3, 1, 0};
 static const unsigned int ecc_priv_id[] = {1, 2, 0};
@@ -3607,7 +3616,17 @@ void tls_certificate_set_priv(struct TLSCertificate *cert, const unsigned char *
 }
 
 void tls_certificate_set_sign_key(struct TLSCertificate *cert, const unsigned char *val, int len) {
-    if ((!val[0]) && (len % 2)) {
+    if ((!val) || (len <= 0))
+        return;
+    // FIX: was ((!val[0]) && (len % 2)). The leading byte is the BIT STRING
+    // "unused bits" counter (always 0 for a signature) and must always be
+    // dropped. The len % 2 test happened to hold for RSA, whose signature is a
+    // fixed 1 + modulus_size (257 for RSA-2048). An ECDSA signature is a DER
+    // SEQUENCE { r INTEGER, s INTEGER } of variable size: for P-384 the BIT
+    // STRING is 103, 104 or 105 bytes depending on the leading bit of r and s,
+    // so roughly half of all ECDSA certificates kept the stray 0x00 and failed
+    // verification. Also guards against reading val[0] on an empty buffer.
+    if ((len > 1) && (!val[0])) {
         val++;
         len--;
     }
@@ -3825,7 +3844,14 @@ void tls_certificate_set_algorithm(struct TLSContext *context, unsigned int *alg
             return;
         }
         if (_is_oid(val, TLS_EC_prime256v1_OID, len)) {
-            *algorithm = TLS_EC_prime256v1;
+            // FIX: was TLS_EC_prime256v1. That constant is 0x18, which is
+            // numerically identical to TLS_EC_secp384r1 (24) -- the 0x12..0x18
+            // block and the IANA named-curve ids (21/23/24/25) share the same
+            // value space and collide. Every P-256 certificate therefore ended
+            // up looking like P-384 to anything reading cert->ec_algorithm.
+            // prime256v1, secp256r1 and NIST P-256 are the same curve, so the
+            // IANA id is the correct value to store.
+            *algorithm = TLS_EC_secp256r1;
             return;
         }
     }
@@ -9218,6 +9244,30 @@ unsigned char *_private_tls_compute_hash(int algorithm, const unsigned char *mes
     return hash;
 }
 
+#ifdef TLS_ECDSA_SUPPORTED
+// FIX: helper for tls_certificate_verify_signature() below. libtomcrypt's
+// ecc_import() (CRYPT 0x0117) parses LTC's own key serialization, not an X.509
+// subjectPublicKeyInfo, so feeding it parent->der_bytes always returned
+// CRYPT_INVALID_PACKET (7) and every ECDSA chain failed. The parser already
+// stores the raw X9.63 point in cert->pk and the IANA curve id in
+// cert->ec_algorithm; _private_tls_ecc_import_pk() consumes exactly that and is
+// what the rest of this file uses for ECDSA. This maps the curve id back to the
+// parameter block.
+static const struct ECCCurveParameters *_private_tls_curve_from_iana(unsigned int iana) {
+    switch (iana) {
+        case TLS_EC_secp224r1:
+            return &secp224r1;
+        case TLS_EC_secp256r1:
+            return &secp256r1;
+        case TLS_EC_secp384r1:
+            return &secp384r1;
+        case TLS_EC_secp521r1:
+            return &secp521r1;
+    }
+    return NULL;
+}
+#endif
+
 int tls_certificate_verify_signature(struct TLSCertificate *cert, struct TLSCertificate *parent) {
     if ((!cert) || (!parent) || (!cert->sign_key) || (!cert->fingerprint) || (!cert->sign_len) || (!parent->der_bytes) || (!parent->der_len)) {
         DEBUG_PRINT("CANNOT VERIFY SIGNATURE\n");
@@ -9263,19 +9313,29 @@ int tls_certificate_verify_signature(struct TLSCertificate *cert, struct TLSCert
 #ifdef TLS_ECDSA_SUPPORTED
     if (cert->algorithm == TLS_ECDSA_SIGN_SHA224 || cert->algorithm == TLS_ECDSA_SIGN_SHA256 || cert->algorithm == TLS_ECDSA_SIGN_SHA384 || cert->algorithm == TLS_ECDSA_SIGN_SHA512) {
         ecc_key key;
-        int err = ecc_import(parent->der_bytes, parent->der_len, &key);
+        // FIX: was ecc_import(parent->der_bytes, parent->der_len, &key), which
+        // cannot read an X.509 subjectPublicKeyInfo. See the helper above.
+        const struct ECCCurveParameters *curve = _private_tls_curve_from_iana(parent->ec_algorithm);
+        if ((!curve) || (!parent->pk) || (!parent->pk_len)) {
+            DEBUG_PRINT("Unsupported or missing ECC public key in parent certificate (curve: %u)\n", (unsigned int)parent->ec_algorithm);
+            return 0;
+        }
+        int err = _private_tls_ecc_import_pk(parent->pk, parent->pk_len, &key, (const ltc_ecc_set_type *)&curve->dp);
         if (err) {
             DEBUG_PRINT("Error importing ECC certificate (code: %i)\n", err);
-            DEBUG_DUMP_HEX_LABEL("CERTIFICATE", parent->der_bytes, parent->der_len);
+            DEBUG_DUMP_HEX_LABEL("PUBLIC KEY", parent->pk, parent->pk_len);
             return 0;
         }
         int ecc_stat = 0;
         unsigned char *signature = cert->sign_key;
         int signature_len = cert->sign_len;
-        //if (!signature[0]) {
-        //    signature++;
-        //    signature_len--;
-        //}
+        // FIX: FIPS 186-4 requires the leftmost min(N, outlen) bits of the hash
+        // when the digest is longer than the curve order. libtomcrypt 1.17's
+        // ecc_verify_hash() reads the whole digest without truncating, so e.g. a
+        // P-256 key signing with SHA-384 never verified. Harmless for the common
+        // matched pairs (P-256/SHA-256, P-384/SHA-384), where this is a no-op.
+        if (hash_len > curve->size)
+            hash_len = curve->size;
         err = ecc_verify_hash(signature, signature_len, cert->fingerprint, hash_len, &ecc_stat, &key);
         ecc_free(&key);
         if (err) {
@@ -9587,7 +9647,10 @@ int _private_asn1_parse(struct TLSContext *context, struct TLSCertificate *cert,
                     DEBUG_PRINT("BITSTREAM(%i): ", length);
                     DEBUG_DUMP_HEX(&buffer[pos], length);
                     DEBUG_PRINT("\n");
-                    if (_is_field(fields, sign_id)) {
+                    // FIX: pin the nesting level. The signatureValue is the only
+                    // BIT STRING that is a direct child of the Certificate
+                    // SEQUENCE, so this cannot alias anything else.
+                    if ((level == 2) && (_is_field(fields, sign_id))) {
                         tls_certificate_set_sign_key(cert, &buffer[pos], length);
                     } else
                     if ((cert->ec_algorithm) && (_is_field(fields, pk_id))) {
