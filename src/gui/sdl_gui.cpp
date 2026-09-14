@@ -1883,7 +1883,8 @@ void GFX_InitSdl()
 		E_Exit("SDL: Failed to init SDL video and timer: %s",
 		       SDL_GetError());
 	}
-
+	SDL_StopTextInput();
+	
 	if (is_using_kmsdrm_driver() && !check_kmsdrm_setting()) {
 		E_Exit("SDL: /dev/input/event0 is not readable, quitting early to prevent TTY input lockup.\n"
 		       "Please run: 'sudo usermod -aG input $(whoami)', then re-login and try again.");
