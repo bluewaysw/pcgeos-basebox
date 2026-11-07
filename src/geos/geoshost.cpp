@@ -15,6 +15,10 @@
  *     - Video (api 1) : display mode and DPI queries
  *     - SSL   (api 2) : TLS context, handshake, read/write  [range 1200–1299]
  *     - Socket(api 3) : TCP resolve, connect, send, recv     [range 1000–1199]
+ *     - FS    (api 4) : DOS-compatible file system fast path  [range 1300–1399]
+ *     - HOSTFS (api 5) : live, writable host file system      [range 1400–1499]
+ *                       (geoshost_hostfs.cpp, hostfs_volume.cpp)
+ *                       (implemented in geoshost_fs.cpp)
  *
  *   Sub-APIs self-register at init; command dispatch and version queries are
  *   handled by a central dispatcher. See GeosHostSubAPI and its subclasses.
@@ -39,6 +43,8 @@
 #include "SDL3_net/SDL_net.h"
 
 #include "tls_root_ca.h"
+#include "geoshost_fs.h"
+#include "geoshost_hostfs.h"
 #include "tlse.h"
 
 #if C_GEOSHOST
@@ -468,6 +474,7 @@ EventRecord* G_eventRecords = NULL; /**< Head of the pending event queue
 AsyncOp* G_opRecords = NULL; /**< Head of the active async operation list */
 
 void GeosHost_NotifySocketChange(); /* Forward declaration */
+void GeosHost_SendEvent(uint16_t* eventRecord); /* Forward declaration */
 
 /* ----------------------------------------------------------------
  * Guest memory access helpers
@@ -699,6 +706,35 @@ public:
 	void HandleCommand(uint16_t cmd) override;
 };
 
+/** @brief Host file system sub-API: live, writable host directory
+ *  [range 1400–1499]. Logic in geoshost_hostfs.cpp / hostfs_volume.cpp. */
+class HostFsSubAPI : public RangeSubAPI {
+public:
+	HostFsSubAPI()
+	        : RangeSubAPI(HIF_API_HOSTFS, HIF_API_HOSTFS_VERSION,
+	                      HOSTFS_BASE, HOSTFS_END)
+	{}
+	void HandleCommand(uint16_t) override
+	{
+		GEOSHOST_HOSTFS_HandleCommand(G_commandBuffer, G_responseBuffer);
+		G_responseOffset = 6;
+	}
+};
+
+/** @brief File system sub-API: DOS-compatible fast path [range 1300–1399].
+ *  All logic lives in geoshost_fs.cpp; this only adapts the dispatcher. */
+class FsSubAPI : public RangeSubAPI {
+public:
+	FsSubAPI()
+	        : RangeSubAPI(HIF_API_FS, HIF_API_FS_VERSION, HIF_FS_BASE, HIF_FS_END)
+	{}
+	void HandleCommand(uint16_t) override
+	{
+		GEOSHOST_FS_HandleCommand(G_commandBuffer, G_responseBuffer);
+		G_responseOffset = 6;
+	}
+};
+
 // ============================================================
 // Sub-API dispatcher
 //
@@ -857,6 +893,9 @@ static void PollSockets()
  */
 static void GeosHost_TickHandler(void)
 {
+	GEOSHOST_HOSTFS_Tick();  // host file system change detection
+	GEOSHOST_FS_Tick();      // DOS drives: host change detection
+
 
 	// Check for AsyncOp completion
 	AsyncOp* nextOp = G_opRecords;
@@ -871,6 +910,18 @@ static void GeosHost_TickHandler(void)
 	}
 	if (G_protectedOpMode == cpu.pmode) {
 		PollSockets();
+	}
+
+	// Detect MOUNT / IMGMOUNT / unmount / disk swaps and tell GEOS.
+	// Only queue the event if someone listens, so the queue cannot grow
+	// unbounded while no GEOS (or no HostIf library) is running.
+	uint16_t driveGeneration = 0;
+	if (GEOSHOST_FS_PollDriveChange(driveGeneration) && G_eventInterrupt) {
+		uint16_t eventRecord[6] = {};
+		eventRecord[0] = HIF_EVENT_NOTIFICATION;
+		eventRecord[1] = HIF_NOTIFY_DRIVE_CHANGE;
+		eventRecord[2] = driveGeneration;
+		GeosHost_SendEvent(eventRecord);
 	}
 
 	// if in the matching operation mode: real mode or protected mode
@@ -2137,11 +2188,15 @@ void GEOSHOST_Init()
 	static VideoSubAPI videoAPI;
 	static NetworkSubAPI networkAPI;
 	static SSLSubAPI sslAPI;
+	static FsSubAPI fsAPI;
+	static HostFsSubAPI hostFsAPI;
 
 	RegisterSubAPI(&hostAPI);
 	RegisterSubAPI(&videoAPI);
 	RegisterSubAPI(&networkAPI);
 	RegisterSubAPI(&sslAPI);
+	RegisterSubAPI(&fsAPI);
+	RegisterSubAPI(&hostFsAPI);
 
 	TIMER_AddTickHandler(GeosHost_TickHandler);
 
