@@ -285,6 +285,7 @@ public:
 	bool next_change(ChangeEvent& event);
 	void poll();
 	bool has_changes() const { return !changes_.empty(); }
+	size_t pending_changes() const { return changes_.size(); }
 
 	static constexpr size_t MaxWatchedDirs   = 32;
 	static constexpr size_t MaxCachedHeaders = 50000;

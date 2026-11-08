@@ -28,9 +28,13 @@
  *
  * HIF_FS_INT21
  *   in:  bx:cx = HostFsFrame, dx = frame size (>= HOST_FS_FRAME_SIZE)
- *   out: ax = HIF_OK and si = HIF_FS_MAGIC when the call was executed
- *        (results, CF and extended error are in the frame), or
- *        ax = HIF_FS_NOT_HANDLED when the guest must issue a real INT 21h.
+ *   out: ax = HIF_OK (request understood), si = HIF_FS_MAGIC, and
+ *          bx = HIF_FS_EXECUTED: done, results, CF and extended error
+ *               are in the frame
+ *          bx = HIF_FS_NOT_EXECUTED: the guest must issue a real INT 21h
+ *               (also for requests the host can't take, e.g. a bad frame)
+ *   ax only ever carries a HostIfResults code, as HostIfCall interprets
+ *   it (HIF_PENDING); the file system outcome is in bx.
  *
  * HIF_FS_GET_DRIVE_INFO
  *   in:  si = drive (0 = A:)
@@ -77,10 +81,14 @@ constexpr uint16_t HIF_FS_END                  = 1399;
 constexpr uint16_t HIF_FS_MAGIC = 0x5346; // 'FS'
 
 /** Result code: request not executed, guest must use the regular path. */
-constexpr uint16_t HIF_FS_NOT_HANDLED = 8;
+constexpr uint16_t HIF_FS_EXECUTED     = 1;
+constexpr uint16_t HIF_FS_NOT_EXECUTED = 0;
 
 /** Notification type delivered through the event interrupt. */
 constexpr uint16_t HIF_NOTIFY_DRIVE_CHANGE = 3;
+
+/** Notification type: host file changes are queued for HIF_FS_POLL_CHANGES. */
+constexpr uint16_t HIF_NOTIFY_FS_CHANGES = 4;
 
 /** HIF_FS_ENABLE options (di). */
 constexpr uint16_t HIF_FS_OPT_DRIVE_NOTIFY = 0x0001; // send drive change events
@@ -109,7 +117,11 @@ void GEOSHOST_FS_HandleCommand(const uint16_t cmd[6], uint16_t resp[6]);
  */
 bool GEOSHOST_FS_PollDriveChange(uint16_t& generation);
 
-/** Call from the tick handler; checks watched directories once a second. */
-void GEOSHOST_FS_Tick();
+/**
+ * Call from the tick handler; checks watched directories once a second.
+ * @return true if changes became pending (the queue was empty before),
+ *         so the caller can send HIF_NOTIFY_FS_CHANGES
+ */
+bool GEOSHOST_FS_Tick();
 
 #endif // DOSBOX_GEOSHOST_FS_H

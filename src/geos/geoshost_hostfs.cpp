@@ -773,18 +773,23 @@ void cmd_call(const uint16_t cmd[6], uint16_t resp[6])
 
 } // namespace
 
-void GEOSHOST_HOSTFS_Tick()
+bool GEOSHOST_HOSTFS_Tick()
 {
 	// Scanning reads the watched directories on the host, so only do it
 	// about once a second (ticks are emulated milliseconds).
 	static unsigned ticks = 0;
 	if (volumes.empty() || ++ticks < 1000) {
-		return;
+		return false;
 	}
 	ticks = 0;
+	// Report every scan that queued something (see GEOSHOST_FS_Tick)
+	bool queued_new = false;
 	for (auto& v : volumes) {
+		const size_t before = v->pending_changes();
 		v->poll();
+		queued_new |= v->pending_changes() > before;
 	}
+	return queued_new;
 }
 
 void GEOSHOST_HOSTFS_HandleCommand(const uint16_t cmd[6], uint16_t resp[6])
