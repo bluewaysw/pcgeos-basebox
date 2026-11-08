@@ -145,9 +145,41 @@ bool read_header(const fs::path& p, uint8_t (&h)[HeaderSize], uint16_t* geode_at
 	return true;
 }
 
+// std::chrono::clock_cast is missing in Apple's libc++. There, convert
+// via the offset between the two clocks (taken from now() of both, so it
+// is off by microseconds at most; DOS times have 2-second resolution).
+#if defined(_LIBCPP_VERSION)
+std::chrono::system_clock::time_point to_sys_time(const fs::file_time_type ft)
+{
+	const auto file_now = fs::file_time_type::clock::now();
+	const auto sys_now  = std::chrono::system_clock::now();
+	// Round to whole seconds so the offset's jitter can't move a time
+	// across a (2-second) DOS time step
+	return std::chrono::round<std::chrono::seconds>(ft - file_now + sys_now);
+}
+
+fs::file_time_type from_sys_time(const std::chrono::system_clock::time_point tp)
+{
+	const auto file_now = fs::file_time_type::clock::now();
+	const auto sys_now  = std::chrono::system_clock::now();
+	return std::chrono::time_point_cast<fs::file_time_type::duration>(tp - sys_now +
+	                                                                  file_now);
+}
+#else
+std::chrono::system_clock::time_point to_sys_time(const fs::file_time_type ft)
+{
+	return std::chrono::clock_cast<std::chrono::system_clock>(ft);
+}
+
+fs::file_time_type from_sys_time(const std::chrono::system_clock::time_point tp)
+{
+	return std::chrono::clock_cast<fs::file_time_type::clock>(tp);
+}
+#endif
+
 void to_date_time(const fs::file_time_type ft, uint16_t& date, uint16_t& time)
 {
-	const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(ft);
+	const auto sys = to_sys_time(ft);
 	const std::time_t tt = std::chrono::system_clock::to_time_t(sys);
 	std::tm t{};
 #ifdef _WIN32
@@ -175,15 +207,12 @@ fs::file_time_type from_date_time(const uint16_t date, const uint16_t time)
 	t.tm_sec   = (time & 0x1f) * 2;
 	t.tm_isdst = -1;
 	const auto sys = std::chrono::system_clock::from_time_t(std::mktime(&t));
-	return std::chrono::clock_cast<fs::file_time_type::clock>(sys);
+	return from_sys_time(sys);
 }
 
 void now_date_time(uint16_t& date, uint16_t& time)
 {
-	to_date_time(std::chrono::clock_cast<fs::file_time_type::clock>(
-	                     std::chrono::system_clock::now()),
-	             date,
-	             time);
+	to_date_time(from_sys_time(std::chrono::system_clock::now()), date, time);
 }
 
 std::string join_rel(const std::string& parent, const std::string& name)
