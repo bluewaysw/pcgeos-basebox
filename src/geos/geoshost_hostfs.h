@@ -24,9 +24,11 @@
  *
  * Changes made on the host
  *   The directories GEOS reads are watched; about once a second the host
- *   compares them with their last state (GEOSHOST_HOSTFS_Tick). The driver
- *   collects the results with HFF_POLL_CHANGES from a background thread
- *   and passes them to FSDGenerateNotify, so folder windows update.
+ *   compares them with their last state (GEOSHOST_HOSTFS_Tick). When changes
+ *   become pending, HIF_NOTIFY_HOSTFS_CHANGES is sent through the event
+ *   interrupt; the HostIf library calls the driver's registered callback,
+ *   which collects them with HFF_POLL_CHANGES and passes them to
+ *   FSDGenerateNotify, so folder windows update.
  *
  * Port commands (6 words in: command, si, bx, cx, dx, di; out: ax, si,
  * bx, cx, dx, di):
@@ -134,11 +136,16 @@ enum HostFsFunction : uint16_t {
 /** Executes one command. Always fills all 6 response words. */
 void GEOSHOST_HOSTFS_HandleCommand(const uint16_t cmd[6], uint16_t resp[6]);
 
+/** Notification type: host changes are queued for HFF_POLL_CHANGES. */
+constexpr uint16_t HIF_NOTIFY_HOSTFS_CHANGES = 5;
+
 /**
  * Call from the tick handler (once per emulated millisecond). About once a
  * second, checks the directories GEOS uses for changes made on the host
  * and queues them for HFF_POLL_CHANGES.
+ * @return true if this check queued new changes, so the caller can send
+ *         HIF_NOTIFY_HOSTFS_CHANGES
  */
-void GEOSHOST_HOSTFS_Tick();
+bool GEOSHOST_HOSTFS_Tick();
 
 #endif // DOSBOX_GEOSHOST_HOSTFS_H

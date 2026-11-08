@@ -236,6 +236,17 @@ public:
 	{
 		memcpy(recordBuf, (const void*)m_Payload, sizeof(m_Payload));
 	}
+
+	/** Whether this record carries exactly @p eventRecord. */
+	bool Matches(const uint16_t* eventRecord) const
+	{
+		for (int i = 0; i < 6; ++i) {
+			if (m_Payload[i] != eventRecord[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
 };
 
 #define UNALLOC_ASYNC_OP_ID 0
@@ -893,8 +904,21 @@ static void PollSockets()
  */
 static void GeosHost_TickHandler(void)
 {
-	GEOSHOST_HOSTFS_Tick();  // host file system change detection
-	GEOSHOST_FS_Tick();      // DOS drives: host change detection
+	// Host file changes: tell GEOS once when changes become pending. The
+	// HostIf library calls the file system driver's registered callback,
+	// which collects them. Only if someone listens, so nothing piles up.
+	const bool hostfs_changes = GEOSHOST_HOSTFS_Tick();
+	const bool dosfs_changes  = GEOSHOST_FS_Tick();
+	if (G_eventInterrupt) {
+		if (hostfs_changes) {
+			uint16_t eventRecord[6] = {HIF_EVENT_NOTIFICATION, HIF_NOTIFY_HOSTFS_CHANGES};
+			GeosHost_SendEvent(eventRecord);
+		}
+		if (dosfs_changes) {
+			uint16_t eventRecord[6] = {HIF_EVENT_NOTIFICATION, HIF_NOTIFY_FS_CHANGES};
+			GeosHost_SendEvent(eventRecord);
+		}
+	}
 
 
 	// Check for AsyncOp completion
@@ -951,14 +975,26 @@ static void GeosHost_TickHandler(void)
  * Thread-safe (protected by G_eventQueueMutex). If the queue was empty,
  * sets G_recheckEventInterrupt so the tick handler fires the software
  * interrupt on the next cycle.
+ *
+ * A notification identical to one still queued (all 6 words) is dropped:
+ * the guest has not seen the first one yet, so the second adds nothing
+ * (e.g. repeated "changes pending" notifications). Other records, such as
+ * async operation results, are always queued.
  */
 void GeosHost_SendEvent(uint16_t* eventRecord)
 {
-	// Create Event Object
-	EventRecord* newRecord = new EventRecord(eventRecord, NULL);
+	SDL_mutexP(G_eventQueueMutex);
+	if (eventRecord[0] == HIF_EVENT_NOTIFICATION) {
+		for (EventRecord* r = G_eventRecords; r; r = r->GetNext()) {
+			if (r->Matches(eventRecord)) {
+				SDL_mutexV(G_eventQueueMutex);
+				return;
+			}
+		}
+	}
 
 	// Add Event to list
-	SDL_mutexP(G_eventQueueMutex);
+	EventRecord* newRecord = new EventRecord(eventRecord, NULL);
 	if (G_eventRecords == NULL) {
 		G_recheckEventInterrupt = true;
 	}

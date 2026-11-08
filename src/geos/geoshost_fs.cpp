@@ -10,7 +10,7 @@
  *    the global Files[] table exactly as with INT 21h, so fast and regular
  *    calls can be mixed freely, and MOUNT/IMGMOUNT/overlay drives keep
  *    working without any special casing.
- *  - Anything we are not 100% sure about returns HIF_FS_NOT_HANDLED, so
+ *  - Anything we are not 100% sure about returns HIF_FS_NOT_EXECUTED, so
  *    the guest falls back to a real INT 21h.
  *  - Set DTA (1Ah) is never executed here, only observed: it always goes
  *    on to real DOS so the DOS/DPMI DTA stays correct for everything we
@@ -926,7 +926,11 @@ static void cmd_enable(const uint16_t cmd[6], uint16_t resp[6])
 
 static void cmd_int21(const uint16_t cmd[6], uint16_t resp[6])
 {
-	resp[0] = HIF_FS_NOT_HANDLED;
+	// ax only carries the HostIf status; the outcome is in bx (see
+	// geoshost_fs.h)
+	resp[0] = HIF_OK;
+	resp[1] = HIF_FS_MAGIC;
+	resp[2] = HIF_FS_NOT_EXECUTED;
 
 	// Only serve the process that enabled us; anything else (e.g. a DOS
 	// program started from GEOS that somehow reaches this port) takes the
@@ -974,8 +978,7 @@ static void cmd_int21(const uint16_t cmd[6], uint16_t resp[6])
 	for (uint16_t i = 0; i < FrameWords; ++i) {
 		mem_writew(frame + 2 * i, w[i]);
 	}
-	resp[0] = HIF_OK;
-	resp[1] = HIF_FS_MAGIC;
+	resp[2] = HIF_FS_EXECUTED;
 }
 
 static void cmd_drive_info(const uint16_t cmd[6], uint16_t resp[6])
@@ -1046,13 +1049,14 @@ static void cmd_poll_changes(const uint16_t cmd[6], uint16_t resp[6])
 	resp[4] = static_cast<uint16_t>(e.id);
 }
 
-void GEOSHOST_FS_Tick()
+bool GEOSHOST_FS_Tick()
 {
 	static unsigned ticks = 0;
 	if (!fs_enabled || !fs_notify_files || dos_watches.empty() || ++ticks < 1000) {
-		return;
+		return false;
 	}
 	ticks = 0;
+	const size_t queued_before = fs_events.size();
 	std::vector<std::string> gone;
 	for (auto& [key, w] : dos_watches) {
 		std::error_code ec;
@@ -1065,6 +1069,11 @@ void GEOSHOST_FS_Tick()
 	for (const auto& key : gone) {
 		dos_watches.erase(key);
 	}
+	// Report every scan that queued something: a single "became pending"
+	// event could be missed (e.g. before the driver registered its
+	// handler), and the queue would then never be announced again.
+	const bool queued_new = fs_events.size() > queued_before;
+	return queued_new;
 }
 
 void GEOSHOST_FS_HandleCommand(const uint16_t cmd[6], uint16_t resp[6])
@@ -1081,7 +1090,7 @@ void GEOSHOST_FS_HandleCommand(const uint16_t cmd[6], uint16_t resp[6])
 		resp[0] = HIF_OK;
 		resp[1] = drive_generation;
 		break;
-	default: resp[0] = HIF_FS_NOT_HANDLED; break;
+	default: resp[0] = HIF_FAILED; break;
 	}
 }
 
