@@ -16,10 +16,17 @@
  *    attributes come from the header, its data starts after it.
  *  - @DIRNAME.000 supplies a directory's legacy GEOS name and attributes
  *    and is never listed.
- *  - Every other name is the host name, decoded: "%XX" stands for the
- *    byte XX. Names GEOS creates are encoded the same way when they
- *    contain characters the host can't store (or non-ASCII GEOS
- *    characters), so they round-trip exactly.
+ *  - Every other name is the host name, decoded: host names are UTF-8,
+ *    GEOS characters are mapped to and from Unicode (geos_charset.inc,
+ *    generated from Include/char.def), and decomposed names (macOS) are
+ *    composed first. "%XX" stands for the GEOS character XX; names GEOS
+ *    creates use it only where the host can't store the character
+ *    (reserved characters, a leading '.', a trailing '.' or ' ', control
+ *    characters, and the GEOS logo, which has no Unicode equivalent), so
+ *    they round-trip exactly. Older names written with "%XX" for every
+ *    non-ASCII character are still read correctly.
+ *  - Host characters with no GEOS equivalent show as '_', and such names
+ *    always get the "~" hash below, so they stay unique and resolvable.
  *  - GEOS names are limited to 32 characters; longer host names are cut
  *    and get "~" plus a hash of the full host name, keeping the extension.
  *    Host names that are valid 8.3 names are their own short name, all
@@ -355,9 +362,18 @@ private:
 };
 
 // Helpers, exposed for tests
-std::string decode_host_name(const std::string& host_name);
+/**
+ * GEOS name of a host name (no length limit applied).
+ * @param lossy  set to true if a host character had no GEOS equivalent
+ */
+std::string decode_host_name(const std::string& host_name, bool* lossy = nullptr);
+/** Host name (UTF-8) for a GEOS name. */
 std::string encode_geos_name(std::string_view geos_name);
 bool to_dos_name(const std::string& name, char (&out)[DosNameLength]);
+/** Case-insensitive comparison of GEOS names (GEOS character set). */
+bool geos_iequals(std::string_view a, std::string_view b);
+/** Host file time as DOS date and time (local time). */
+void dos_date_time(fs::file_time_type ft, uint16_t& date, uint16_t& time);
 uint16_t to_file_date(int year, int month, int day);
 uint16_t to_file_time(int hour, int minute, int second);
 uint32_t path_id(const std::string& rel, uint32_t seed = 0);

@@ -3,6 +3,7 @@ libgeos_sources = files(
     'geoshost_fs.cpp',
     'geoshost_mem.cpp',
     'geoshost_hostfs.cpp',
+    'hostfs_lfn.cpp',
     'hostfs_volume.cpp',
     'tlse.c',
 )

@@ -24,11 +24,14 @@
 
 #include "geoshost_fs.h"
 #include "geoshost_mem.h"
+#include "hostfs_lfn.h"
+#include "hostfs_volume.h"
 
 #include <algorithm>
 #include <array>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -65,6 +68,7 @@ static bool fs_enabled       = false; // HIF_FS_ENABLE succeeded
 static uint16_t fs_guest_psp = 0;     // PSP the guest registered
 static bool fs_notify_drives = false; // guest wants HIF_NOTIFY_DRIVE_CHANGE
 static bool fs_notify_files  = false; // guest polls HIF_FS_POLL_CHANGES
+static bool fs_lfn           = false; // long file names granted (v2)
 
 // DTA observed from the guest's last AH=1Ah. "Armed" only until the next
 // request we see: the GEOS driver sets the DTA right before every
@@ -252,12 +256,14 @@ constexpr uint16_t FCNT_CONTENTS = 4;
 struct DosWatch {
 	struct Seen {
 		std::string short_name = {}; // as DOS shows it ("README.TXT")
+		std::string long_name  = {}; // GEOS name, in LFN mode
 		uintmax_t size         = 0;
 		stdfs::file_time_type mtime = {};
 		bool is_dir            = false;
 	};
 	uint8_t drive         = 0;
 	std::string dos_dir   = {}; // "DIR\SUB", no drive, no leading '\'
+	std::string long_dir  = {}; // the same in GEOS names, in LFN mode
 	std::string host_dir  = {}; // real host path, for listing the directory
 	std::string cache_dir = {}; // basedir + DOS names + separator: the form
 	                            // DOSBox's directory cache resolves (its
@@ -335,9 +341,14 @@ std::string short_name_of(localDrive& ld, const std::string& full, const std::st
 	return {};
 }
 
-/** Name GEOS uses for a new file: its GEOS long name, else the DOS name. */
+/**
+ * Name GEOS uses for a new file: its GEOS long name, else the DOS name
+ * (in LFN mode the name the LFN calls show).
+ */
 std::string geos_name_of(const std::string& full, const DosWatch::Seen& seen)
 {
+	const std::string& fallback = fs_lfn && !seen.long_name.empty() ? seen.long_name
+	                                                                 : seen.short_name;
 	if (!seen.is_dir && seen.size >= 256) {
 		if (std::FILE* f = std::fopen(full.c_str(), "rb")) {
 			uint8_t h[40] = {};
@@ -353,8 +364,20 @@ std::string geos_name_of(const std::string& full, const DosWatch::Seen& seen)
 			}
 		}
 	}
-	return seen.short_name;
+	return fallback;
 }
+
+/** Name the change IDs are computed over: long in LFN mode, else short. */
+const std::string& id_name_of(const DosWatch::Seen& seen)
+{
+	return fs_lfn && !seen.long_name.empty() ? seen.long_name : seen.short_name;
+}
+
+// Long file name helpers, defined with the LFN calls below
+std::string lfn_long_dir(uint8_t drive, const std::string& short_dir);
+std::unordered_map<std::string, std::string> lfn_long_names(localDrive& ld,
+                                                            const std::string& host_dir,
+                                                            const std::string& cache_dir);
 
 bool dos_file_open(const uint8_t drive, const std::string& rel)
 {
@@ -382,15 +405,22 @@ void scan_watch(DosWatch& w, const bool report)
 	if (ec) {
 		return;
 	}
-	const uint32_t did = dir_id(w.dos_dir);
+	const uint32_t did = dir_id(fs_lfn ? w.long_dir : w.dos_dir);
+	const auto long_names = fs_lfn ? lfn_long_names(*ld, w.host_dir, w.cache_dir)
+	                              : std::unordered_map<std::string, std::string>{};
 	std::string sep_dir = w.host_dir;
 	if (!sep_dir.empty() && sep_dir.back() != CROSS_FILESPLIT) {
 		sep_dir.push_back(CROSS_FILESPLIT);
 	}
 	const std::string& cache_dir = w.cache_dir;
 	std::unordered_map<std::string, DosWatch::Seen> now;
-	for (const auto& e : it) {
-		const std::string name = e.path().filename().string();
+	// Neither the name conversion nor stepping through the directory may
+	// throw: this runs from the tick handler. On Windows the name is the
+	// ANSI form DOSBox's DOS core uses; names it can't represent (and so
+	// DOS can't reach) are skipped, as in the LFN listing.
+	for (const stdfs::directory_iterator end; !ec && it != end; it.increment(ec)) {
+		const auto& e          = *it;
+		const std::string name = HostLfn::native_name(e.path().filename());
 		if (name.empty() || name == "." || name == "..") {
 			continue;
 		}
@@ -417,11 +447,15 @@ void scan_watch(DosWatch& w, const bool report)
 				}
 			}
 			seen.short_name = short_name_of(*ld, cpath, name);
+			if (const auto ln = long_names.find(name); ln != long_names.end()) {
+				seen.long_name = ln->second;
+			}
 			if (report && !seen.short_name.empty()) {
 				fs_events.push_back({FCNT_CREATE, w.drive, did, geos_name_of(full, seen)});
 			}
 		} else {
 			seen.short_name = prev->second.short_name;
+			seen.long_name  = prev->second.long_name;
 			const bool changed = prev->second.size != seen.size ||
 			                     prev->second.mtime != seen.mtime;
 			const std::string rel = w.dos_dir.empty() ? seen.short_name
@@ -429,7 +463,7 @@ void scan_watch(DosWatch& w, const bool report)
 			if (report && changed && !seen.is_dir && !seen.short_name.empty() &&
 			    !dos_file_open(w.drive, rel)) {
 				fs_events.push_back(
-				        {FCNT_CONTENTS, w.drive, dos_id(did, seen.short_name), {}});
+				        {FCNT_CONTENTS, w.drive, dos_id(did, id_name_of(seen)), {}});
 			}
 		}
 		now[name] = seen;
@@ -446,7 +480,7 @@ void scan_watch(DosWatch& w, const bool report)
 			}
 			if (!seen.short_name.empty()) {
 				fs_events.push_back(
-				        {FCNT_DELETE, w.drive, dos_id(did, seen.short_name), {}});
+				        {FCNT_DELETE, w.drive, dos_id(did, id_name_of(seen)), {}});
 			}
 		}
 	}
@@ -515,6 +549,9 @@ void watch_dos(const char* name, const bool is_dir)
 	if (!dir.empty()) {
 		w.cache_dir.push_back(CROSS_FILESPLIT);
 	}
+	if (fs_lfn) {
+		w.long_dir = lfn_long_dir(drive, dir);
+	}
 	w.used = ++dos_watch_clock;
 	scan_watch(w, false);
 	dos_watches.emplace(key, std::move(w));
@@ -535,6 +572,845 @@ void resync_dos(const char* name, const bool is_dir)
 	if (it != dos_watches.end()) {
 		scan_watch(it->second, false);
 	}
+}
+
+} // namespace
+
+/* ----------------------------------------------------------------
+ * Long file names (INT 21h AX=71xxh), see geoshost_fs.h
+ *
+ * Paths are resolved component by component against the host directory
+ * (HostLfn::list_dir: GEOS names, full host names and DOS short names all
+ * match) and turned into DOS short paths, so the actual work is done by
+ * the DOS core as for every other call: handles, the current directory
+ * and the directory cache stay DOSBox's. Only creating a long name is
+ * done on the host directly, then the new entry is added to the cache.
+ *
+ * Drives that aren't directory mounts (images, CD-ROM images, Z:) get
+ * the calls with plain 8.3 semantics through the DOS core.
+ * ---------------------------------------------------------------- */
+
+namespace {
+
+constexpr uint16_t LfnNotLocal = 0xffff; // lfn_resolve: use the 8.3 path
+
+struct LfnSearch {
+	std::vector<HostLfn::Entry> entries = {};
+	size_t next                         = 0;
+	uint64_t used                       = 0;
+};
+std::map<uint16_t, LfnSearch> lfn_searches;
+uint16_t lfn_next_handle = 1;
+uint64_t lfn_clock       = 0;
+
+void lfn_reset()
+{
+	lfn_searches.clear();
+	lfn_next_handle = 1;
+}
+
+bool read_guest_lfn(const uint16_t seg, const uint16_t off, std::string& out)
+{
+	GuestSpan span;
+	if (!resolve(seg, off, Access::Read, span)) {
+		return false;
+	}
+	const uint32_t max = std::min<uint32_t>(span.avail, HostLfn::MaxPath);
+	out.clear();
+	for (uint32_t i = 0; i < max; ++i) {
+		const auto c = static_cast<char>(mem_readb(span.base + i));
+		if (c == '\0') {
+			return true;
+		}
+		out.push_back(c);
+	}
+	return false;
+}
+
+bool write_guest(const uint16_t seg, const uint16_t off, const void* data, const uint32_t len)
+{
+	PhysPt dest = 0;
+	if (!resolve_len(seg, off, len, Access::Write, dest)) {
+		return false;
+	}
+	MEM_BlockWrite(dest, data, len);
+	return true;
+}
+
+bool write_guest_string(const uint16_t seg, const uint16_t off, const std::string& s)
+{
+	if (s.size() >= HostLfn::MaxPath) {
+		return false;
+	}
+	return write_guest(seg, off, s.c_str(), static_cast<uint32_t>(s.size() + 1));
+}
+
+Outcome lfn_fail(Regs& r, const uint16_t err)
+{
+	DOS_SetError(err);
+	r.fail();
+	return Outcome::Handled;
+}
+
+/** A directory on a directory mount, in all its name forms. */
+struct LfnDir {
+	uint8_t drive = 0;
+	std::shared_ptr<localDrive> ld = {};
+	std::vector<std::string> short_comps  = {};
+	std::vector<std::string> long_comps   = {};
+	std::vector<std::string> native_comps = {};
+	stdfs::path host  = {}; // host directory
+	std::string cache = {}; // basedir + DOS short names + separator
+	std::vector<HostLfn::Entry> entries = {};
+};
+
+std::string join_comps(const std::vector<std::string>& comps)
+{
+	std::string s;
+	for (const auto& c : comps) {
+		if (!s.empty()) {
+			s.push_back('\\');
+		}
+		s += c;
+	}
+	return s;
+}
+
+/** "C:\DIR\SUB\name" in DOS short names. */
+std::string lfn_short_path(const LfnDir& d, const std::string& name = {})
+{
+	std::string s = std::string(1, static_cast<char>('A' + d.drive)) + ":\\";
+	s += join_comps(d.short_comps);
+	if (!name.empty()) {
+		if (!d.short_comps.empty()) {
+			s.push_back('\\');
+		}
+		s += name;
+	}
+	return s;
+}
+
+void lfn_rebuild(LfnDir& d)
+{
+	const std::string base = d.ld->GetBasedir();
+	d.host  = HostLfn::from_native(base);
+	d.cache = base;
+	if (!d.cache.empty() && d.cache.back() != CROSS_FILESPLIT) {
+		d.cache.push_back(CROSS_FILESPLIT);
+	}
+	for (size_t i = 0; i < d.native_comps.size(); ++i) {
+		d.host /= HostLfn::from_native(d.native_comps[i]);
+		d.cache += d.short_comps[i];
+		d.cache.push_back(CROSS_FILESPLIT);
+	}
+	d.entries.clear();
+}
+
+bool lfn_root(const uint8_t drive, LfnDir& d)
+{
+	d       = {};
+	d.drive = drive;
+	d.ld    = local_drive(drive);
+	if (!d.ld) {
+		return false;
+	}
+	lfn_rebuild(d);
+	return true;
+}
+
+HostLfn::ShortNameFn lfn_short_names(localDrive& ld, const std::string& cache)
+{
+	return [&ld, cache](const std::string& native, const bool is_dir) {
+		const std::string cpath = cache + native;
+		std::string s           = short_name_of(ld, cpath, native);
+		if (s.empty()) {
+			// Not in the directory cache yet (created on the host). As
+			// in scan_watch: AddEntry only creates file entries.
+			if (is_dir) {
+				ld.dirCache.CacheOut(cpath.c_str(), true);
+			} else {
+				ld.dirCache.AddEntry(cpath.c_str(), true);
+			}
+			s = short_name_of(ld, cpath, native);
+		}
+		return s;
+	};
+}
+
+void lfn_list(LfnDir& d)
+{
+	d.entries = HostLfn::list_dir(d.host, lfn_short_names(*d.ld, d.cache));
+}
+
+void lfn_descend(LfnDir& d, const HostLfn::Entry& e)
+{
+	d.short_comps.push_back(e.short_name);
+	d.long_comps.push_back(e.geos_name);
+	d.native_comps.push_back(e.native_name);
+	lfn_rebuild(d);
+}
+
+bool lfn_ascend(LfnDir& d)
+{
+	if (d.short_comps.empty()) {
+		return false;
+	}
+	d.short_comps.pop_back();
+	d.long_comps.pop_back();
+	d.native_comps.pop_back();
+	lfn_rebuild(d);
+	return true;
+}
+
+std::vector<std::string> split_short(const std::string& s)
+{
+	std::vector<std::string> out;
+	size_t start = 0;
+	while (start < s.size()) {
+		const auto end = s.find('\\', start);
+		const auto stop = end == std::string::npos ? s.size() : end;
+		if (stop > start) {
+			out.push_back(s.substr(start, stop - start));
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return out;
+}
+
+/** A path resolved to its directory plus its last component. */
+struct LfnTarget {
+	LfnDir dir           = {};
+	std::string last     = {}; // as given (GEOS characters); empty: the directory
+	bool exists          = false;
+	HostLfn::Entry entry = {}; // if exists
+};
+
+/**
+ * Resolve a GEOS path. Returns 0, a DOS error, or LfnNotLocal if the drive
+ * is not a directory mount.
+ */
+uint16_t lfn_resolve(const std::string& path, LfnTarget& t)
+{
+	HostLfn::SplitPath sp;
+	if (!HostLfn::split_path(path, sp)) {
+		return DOSERR_PATH_NOT_FOUND;
+	}
+	const uint8_t drive = sp.drive >= 0 ? static_cast<uint8_t>(sp.drive)
+	                                    : DOS_GetDefaultDrive();
+	if (drive >= DOS_DRIVES || !Drives[drive]) {
+		return DOSERR_INVALID_DRIVE;
+	}
+	if (!lfn_root(drive, t.dir)) {
+		return LfnNotLocal;
+	}
+	std::vector<std::string> comps;
+	if (!sp.absolute) {
+		comps = split_short(Drives[drive]->curdir); // DOS keeps it short
+	}
+	comps.insert(comps.end(), sp.comps.begin(), sp.comps.end());
+
+	std::string last;
+	if (!comps.empty()) {
+		last = comps.back();
+		comps.pop_back();
+	}
+	for (const auto& c : comps) {
+		if (c == ".") {
+			continue;
+		}
+		if (c == "..") {
+			if (!lfn_ascend(t.dir)) {
+				return DOSERR_PATH_NOT_FOUND;
+			}
+			continue;
+		}
+		lfn_list(t.dir);
+		const HostLfn::Entry* e = HostLfn::find_entry(t.dir.entries, c);
+		if (!e || !e->is_dir) {
+			return DOSERR_PATH_NOT_FOUND;
+		}
+		const HostLfn::Entry copy = *e;
+		lfn_descend(t.dir, copy);
+	}
+	if (last == ".") {
+		last.clear();
+	} else if (last == "..") {
+		if (!lfn_ascend(t.dir)) {
+			return DOSERR_PATH_NOT_FOUND;
+		}
+		last.clear();
+	}
+	t.last = last;
+	lfn_list(t.dir);
+	if (!last.empty() && !HostLfn::has_wildcards(last)) {
+		if (const HostLfn::Entry* e = HostLfn::find_entry(t.dir.entries, last)) {
+			t.exists = true;
+			t.entry  = *e;
+		}
+	}
+	return 0;
+}
+
+/** DOS short path of an existing target (or of its directory). */
+std::string lfn_target_short(const LfnTarget& t)
+{
+	return lfn_short_path(t.dir, t.exists ? t.entry.short_name : std::string());
+}
+
+std::string drive_prefix(const uint8_t drive)
+{
+	return std::string(1, static_cast<char>('A' + drive)) + ":\\";
+}
+
+/** Host path for a new GEOS name in t.dir, or empty if it can't be made. */
+stdfs::path lfn_new_host_path(const LfnTarget& t, std::string& native)
+{
+	if (!HostLfn::valid_new_name(t.last) || t.dir.ld->IsReadOnly()) {
+		return {};
+	}
+	const stdfs::path name = HostLfn::from_utf8(HostFs::encode_geos_name(t.last));
+	native                 = HostLfn::native_name(name);
+	if (native.empty()) {
+		return {}; // DOSBox's DOS core couldn't reach it (Windows)
+	}
+	return t.dir.host / name;
+}
+
+/** Search results of a non-mount drive, through the DOS core (8.3 names). */
+bool lfn_classic_list(const std::string& spec, const uint8_t allowed,
+                      std::vector<HostLfn::Entry>& out)
+{
+	ensure_scratch_dta();
+	const RealPt saved = dos.dta();
+	dos.dta(scratch_dta);
+	bool found = DOS_FindFirst(spec.c_str(), FatAttributeFlags(allowed));
+	while (found) {
+		DOS_DTA dta(dos.dta());
+		DOS_DTA::Result res;
+		dta.GetResult(res);
+		HostLfn::Entry e;
+		e.geos_name = e.short_name = e.native_name = res.name;
+		e.is_dir = res.attr.directory;
+		e.attrs  = res.attr._data;
+		e.size   = res.size;
+		e.date   = res.date;
+		e.time   = res.time;
+		out.push_back(std::move(e));
+		found = DOS_FindNext();
+	}
+	dos.dta(saved);
+	return !out.empty();
+}
+
+uint16_t lfn_new_handle()
+{
+	if (lfn_searches.size() >= HOST_FS_LFN_MAX_SEARCHES) {
+		auto oldest = lfn_searches.begin();
+		for (auto it = lfn_searches.begin(); it != lfn_searches.end(); ++it) {
+			if (it->second.used < oldest->second.used) {
+				oldest = it;
+			}
+		}
+		lfn_searches.erase(oldest);
+	}
+	while (lfn_next_handle == 0 || lfn_searches.count(lfn_next_handle)) {
+		++lfn_next_handle;
+	}
+	return lfn_next_handle++;
+}
+
+/** Hand out the next entry of a search into ES:DI. */
+Outcome lfn_find_out(Regs& r, LfnSearch& s)
+{
+	if (s.next >= s.entries.size()) {
+		return lfn_fail(r, DOSERR_NO_MORE_FILES);
+	}
+	uint8_t fd[HostLfn::FindDataSize];
+	HostLfn::pack_find_data(s.entries[s.next], fd);
+	if (!write_guest(r.es, r.di, fd, sizeof(fd))) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	++s.next;
+	s.used = ++lfn_clock;
+	r.cx   = 0; // no Unicode conversion problems
+	r.ok();
+	return Outcome::Handled;
+}
+
+Outcome lfn_find_first(Regs& r)
+{
+	std::string spec;
+	if (r.si != 1) {
+		return lfn_fail(r, DOSERR_FUNCTION_NUMBER_INVALID); // DOS times only
+	}
+	if (!read_guest_lfn(r.ds, r.dx, spec)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	const uint8_t allowed  = r.cl();
+	const uint8_t required = static_cast<uint8_t>(r.cx >> 8);
+	LfnSearch s;
+	LfnTarget t;
+	const uint16_t err = lfn_resolve(spec, t);
+	if (err == LfnNotLocal) {
+		std::vector<HostLfn::Entry> all;
+		lfn_classic_list(spec, allowed, all);
+		for (auto& e : all) {
+			if (HostLfn::attrs_match(e.attrs, allowed, required)) {
+				s.entries.push_back(std::move(e));
+			}
+		}
+	} else if (err) {
+		return lfn_fail(r, err);
+	} else {
+		const std::string pattern = t.last.empty() ? "*" : t.last;
+		if (!t.dir.short_comps.empty()) {
+			for (const char* dots : {".", ".."}) {
+				HostLfn::Entry e;
+				e.geos_name = e.short_name = e.native_name = dots;
+				e.is_dir = true;
+				e.attrs  = HostLfn::A_SUBDIR;
+				if (HostLfn::match_pattern(pattern, dots) &&
+				    HostLfn::attrs_match(e.attrs, allowed, required)) {
+					s.entries.push_back(std::move(e));
+				}
+			}
+		}
+		for (const auto& e : t.dir.entries) {
+			if (HostLfn::attrs_match(e.attrs, allowed, required) &&
+			    HostLfn::entry_matches(e, pattern)) {
+				s.entries.push_back(e);
+			}
+		}
+		watch_dos(lfn_short_path(t.dir, "X").c_str(), false);
+	}
+	if (s.entries.empty()) {
+		return lfn_fail(r, HostLfn::has_wildcards(spec) ? DOSERR_NO_MORE_FILES
+		                                                : DOSERR_FILE_NOT_FOUND);
+	}
+	const uint16_t handle = lfn_new_handle();
+	auto& stored          = lfn_searches[handle];
+	stored                = std::move(s);
+	const Outcome o       = lfn_find_out(r, stored);
+	if (!r.cf) {
+		r.ax = handle;
+	} else {
+		lfn_searches.erase(handle);
+	}
+	return o;
+}
+
+Outcome lfn_create_open(Regs& r)
+{
+	std::string name;
+	if (!read_guest_lfn(r.ds, r.si, name)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	const uint16_t mode   = r.bx;
+	const auto attrs      = FatAttributeFlags(r.cl());
+	const uint16_t action = r.dx;
+	uint16_t handle = 0, status = 0;
+	LfnTarget t;
+	const uint16_t err = lfn_resolve(name, t);
+	if (err == LfnNotLocal) {
+		r.result(DOS_OpenFileExtended(name.c_str(), mode, attrs, action, &handle, &status));
+		if (!r.cf) {
+			r.ax = handle;
+			r.cx = status;
+		}
+		return Outcome::Handled;
+	}
+	if (err) {
+		return lfn_fail(r, err);
+	}
+	if (t.last.empty() || (t.exists && t.entry.is_dir)) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	if (HostLfn::has_wildcards(t.last)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	std::string short_path;
+	if (t.exists) {
+		short_path = lfn_target_short(t);
+		r.result(DOS_OpenFileExtended(short_path.c_str(), mode, attrs, action, &handle, &status));
+	} else {
+		if (!(action & 0x10)) {
+			return lfn_fail(r, DOSERR_FILE_NOT_FOUND);
+		}
+		std::string native;
+		const stdfs::path host = lfn_new_host_path(t, native);
+		if (host.empty()) {
+			return lfn_fail(r, HostLfn::valid_new_name(t.last) ? DOSERR_ACCESS_DENIED
+			                                                   : DOSERR_PATH_NOT_FOUND);
+		}
+		{
+			std::ofstream f(host, std::ios::binary);
+			if (!f) {
+				return lfn_fail(r, DOSERR_ACCESS_DENIED);
+			}
+		}
+		const std::string cpath = t.dir.cache + native;
+		t.dir.ld->dirCache.AddEntry(cpath.c_str(), true);
+		const std::string alias = short_name_of(*t.dir.ld, cpath, native);
+		std::error_code ec;
+		if (alias.empty()) {
+			stdfs::remove(host, ec);
+			return lfn_fail(r, DOSERR_ACCESS_DENIED);
+		}
+		short_path = lfn_short_path(t.dir, alias);
+		// replace + create: applies the attributes, and the file is new
+		r.result(DOS_OpenFileExtended(short_path.c_str(), mode, attrs, 0x12, &handle, &status));
+		if (r.cf) {
+			t.dir.ld->dirCache.DeleteEntry(cpath.c_str());
+			stdfs::remove(host, ec);
+			return Outcome::Handled;
+		}
+		status = 2; // created
+	}
+	if (!r.cf) {
+		r.ax = handle;
+		r.cx = status;
+		watch_dos(short_path.c_str(), false);
+		if (status != 1) {
+			resync_dos(short_path.c_str(), false);
+		}
+	}
+	return Outcome::Handled;
+}
+
+Outcome lfn_rename(Regs& r)
+{
+	std::string from, to;
+	if (!read_guest_lfn(r.ds, r.dx, from) || !read_guest_lfn(r.es, r.di, to)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	LfnTarget a, b;
+	const uint16_t ea = lfn_resolve(from, a);
+	const uint16_t eb = lfn_resolve(to, b);
+	if (ea == LfnNotLocal || eb == LfnNotLocal) {
+		if (ea != eb) {
+			return lfn_fail(r, DOSERR_NOT_SAME_DEVICE);
+		}
+		r.result(DOS_Rename(from.c_str(), to.c_str()));
+		return Outcome::Handled;
+	}
+	if (ea) {
+		return lfn_fail(r, ea);
+	}
+	if (eb) {
+		return lfn_fail(r, eb);
+	}
+	if (!a.exists) {
+		return lfn_fail(r, DOSERR_FILE_NOT_FOUND);
+	}
+	if (a.dir.drive != b.dir.drive) {
+		return lfn_fail(r, DOSERR_NOT_SAME_DEVICE);
+	}
+	const stdfs::path old_host = a.dir.host / HostLfn::from_native(a.entry.native_name);
+	if (b.exists) {
+		const bool same = b.dir.host == a.dir.host && b.entry.native_name == a.entry.native_name;
+		if (!same) {
+			return lfn_fail(r, DOSERR_ACCESS_DENIED);
+		}
+		if (b.last == a.entry.geos_name) {
+			r.ok(); // nothing to do
+			return Outcome::Handled;
+		}
+	}
+	std::string native;
+	const stdfs::path new_host = lfn_new_host_path(b, native);
+	if (new_host.empty()) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	const std::string rel = join_comps(a.dir.short_comps) +
+	                        (a.dir.short_comps.empty() ? "" : "\\") + a.entry.short_name;
+	if (!a.entry.is_dir && dos_file_open(a.dir.drive, rel)) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	std::error_code ec;
+	stdfs::rename(old_host, new_host, ec);
+	if (ec) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	auto& cache = a.dir.ld->dirCache;
+	const std::string old_cpath = a.dir.cache + a.entry.native_name;
+	const std::string new_cpath = b.dir.cache + native;
+	if (a.entry.is_dir) {
+		cache.CacheOut(old_cpath.c_str(), true);
+		cache.CacheOut(new_cpath.c_str(), true);
+	} else {
+		cache.DeleteEntry(old_cpath.c_str());
+		cache.AddEntry(new_cpath.c_str(), true);
+	}
+	resync_dos(lfn_short_path(a.dir, "X").c_str(), false);
+	resync_dos(lfn_short_path(b.dir, "X").c_str(), false);
+	r.ok();
+	return Outcome::Handled;
+}
+
+Outcome lfn_full_path(Regs& r)
+{
+	std::string src;
+	const uint8_t how = r.cl();
+	if (how > 2) {
+		return lfn_fail(r, DOSERR_FUNCTION_NUMBER_INVALID);
+	}
+	if (!read_guest_lfn(r.ds, r.si, src)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	LfnTarget t;
+	const uint16_t err = lfn_resolve(src, t);
+	std::string out;
+	if (err == LfnNotLocal) {
+		char buf[DOS_PATHLENGTH] = {};
+		if (!DOS_Canonicalize(src.c_str(), buf)) {
+			r.fail();
+			return Outcome::Handled;
+		}
+		out = buf;
+	} else if (err) {
+		return lfn_fail(r, err);
+	} else {
+		const bool need = how != 0 && !t.last.empty();
+		if (need && !t.exists) {
+			return lfn_fail(r, DOSERR_FILE_NOT_FOUND);
+		}
+		std::vector<std::string> comps = how == 1 ? t.dir.short_comps : t.dir.long_comps;
+		if (!t.last.empty()) {
+			comps.push_back(!t.exists ? t.last
+			                          : (how == 1 ? t.entry.short_name : t.entry.geos_name));
+		}
+		out = drive_prefix(t.dir.drive) + join_comps(comps);
+	}
+	if (!write_guest_string(r.es, r.di, out)) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	r.ok();
+	return Outcome::Handled;
+}
+
+Outcome lfn_current_dir(Regs& r)
+{
+	char buf[DOS_PATHLENGTH] = {};
+	if (!DOS_GetCurrentDir(r.dl(), buf)) {
+		r.fail();
+		return Outcome::Handled;
+	}
+	const uint8_t drive = r.dl() ? static_cast<uint8_t>(r.dl() - 1) : DOS_GetDefaultDrive();
+	std::string out     = buf;
+	LfnDir d;
+	if (lfn_root(drive, d)) {
+		out = lfn_long_dir(drive, buf);
+	}
+	if (!write_guest_string(r.ds, r.si, out)) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	r.ax = 0x0100;
+	r.ok();
+	return Outcome::Handled;
+}
+
+Outcome lfn_volume_info(Regs& r)
+{
+	std::string root;
+	if (!read_guest_lfn(r.ds, r.dx, root)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	HostLfn::SplitPath sp;
+	if (!HostLfn::split_path(root, sp) || sp.drive < 0 || !local_drive(sp.drive)) {
+		return lfn_fail(r, DOSERR_INVALID_DRIVE);
+	}
+	static const char fs_name[] = "BASEBOX";
+	if (r.cx >= sizeof(fs_name) && !write_guest(r.es, r.di, fs_name, sizeof(fs_name))) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	r.bx = HOST_FS_LFN_VOLUME_FLAGS;
+	r.cx = HOST_FS_LFN_MAX_NAME;
+	r.dx = HOST_FS_LFN_MAX_PATH;
+	r.ok();
+	return Outcome::Handled;
+}
+
+/** Path calls that act on one existing or new name: 39, 3A, 3B, 41, 43. */
+Outcome lfn_path_call(Regs& r)
+{
+	std::string path;
+	if (!read_guest_lfn(r.ds, r.dx, path)) {
+		return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+	}
+	const uint8_t fn = r.al();
+	const uint8_t bl = static_cast<uint8_t>(r.bx & 0xff);
+	if ((fn == 0x41 && r.si != 0) || (fn == 0x43 && bl > 1)) {
+		return lfn_fail(r, DOSERR_FUNCTION_NUMBER_INVALID);
+	}
+	LfnTarget t;
+	const uint16_t err = lfn_resolve(path, t);
+	if (err == LfnNotLocal) {
+		// 8.3 semantics through the DOS core
+		const char* p = path.c_str();
+		switch (fn) {
+		case 0x39: r.result(DOS_MakeDir(p)); break;
+		case 0x3a: r.result(DOS_RemoveDir(p)); break;
+		case 0x3b: r.result(DOS_ChangeDir(p)); break;
+		case 0x41: r.result(DOS_UnlinkFile(p)); break;
+		default: {
+			FatAttributeFlags a = {};
+			if (bl == 0) {
+				r.result(DOS_GetFileAttr(p, &a));
+				if (!r.cf) r.cx = a._data;
+			} else {
+				r.result(DOS_SetFileAttr(p, FatAttributeFlags(r.cl())));
+			}
+		}
+		}
+		return Outcome::Handled;
+	}
+	if (err) {
+		return lfn_fail(r, err);
+	}
+	if (fn == 0x39) { // MKDIR
+		if (t.last.empty() || t.exists) {
+			return lfn_fail(r, DOSERR_ACCESS_DENIED);
+		}
+		std::string native;
+		const stdfs::path host = lfn_new_host_path(t, native);
+		if (host.empty()) {
+			return lfn_fail(r, HostLfn::valid_new_name(t.last) ? DOSERR_ACCESS_DENIED
+			                                                   : DOSERR_PATH_NOT_FOUND);
+		}
+		std::error_code ec;
+		if (!stdfs::create_directory(host, ec)) {
+			return lfn_fail(r, DOSERR_ACCESS_DENIED);
+		}
+		t.dir.ld->dirCache.CacheOut((t.dir.cache + native).c_str(), true);
+		resync_dos(lfn_short_path(t.dir, "X").c_str(), false);
+		r.ok();
+		return Outcome::Handled;
+	}
+	if (fn == 0x3b) { // CHDIR
+		if (!t.last.empty()) {
+			if (!t.exists || !t.entry.is_dir) {
+				return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+			}
+			lfn_descend(t.dir, t.entry);
+		}
+		const std::string dir = lfn_short_path(t.dir);
+		r.result(DOS_ChangeDir(dir.c_str()));
+		if (!r.cf) {
+			watch_dos(dir.c_str(), true);
+		}
+		return Outcome::Handled;
+	}
+	if (t.last.empty() && fn != 0x43) {
+		return lfn_fail(r, DOSERR_ACCESS_DENIED);
+	}
+	if (!t.last.empty() && !t.exists) {
+		return lfn_fail(r, fn == 0x3a ? DOSERR_PATH_NOT_FOUND : DOSERR_FILE_NOT_FOUND);
+	}
+	const std::string target = lfn_target_short(t);
+	switch (fn) {
+	case 0x3a: // RMDIR
+		if (!t.entry.is_dir) {
+			return lfn_fail(r, DOSERR_PATH_NOT_FOUND);
+		}
+		r.result(DOS_RemoveDir(target.c_str()));
+		break;
+	case 0x41: // UNLINK
+		if (t.entry.is_dir) {
+			return lfn_fail(r, DOSERR_ACCESS_DENIED);
+		}
+		r.result(DOS_UnlinkFile(target.c_str()));
+		break;
+	default: { // 0x43 attributes
+		FatAttributeFlags a = {};
+		if (bl == 0) {
+			if (t.last.empty()) {
+				a = FatAttributeFlags(HostLfn::A_SUBDIR);
+				r.ok();
+			} else {
+				r.result(DOS_GetFileAttr(target.c_str(), &a));
+			}
+			if (!r.cf) r.cx = a._data;
+			return Outcome::Handled;
+		}
+		r.result(DOS_SetFileAttr(target.c_str(), FatAttributeFlags(r.cl())));
+	}
+	}
+	if (!r.cf) {
+		resync_dos(target.c_str(), false);
+	}
+	return Outcome::Handled;
+}
+
+/** INT 21h AX=71xxh. Never NotHandled: the regular path has no LFN. */
+Outcome execute_lfn(Regs& r)
+{
+	switch (r.al()) {
+	case 0x39:
+	case 0x3a:
+	case 0x3b:
+	case 0x41:
+	case 0x43: return lfn_path_call(r);
+	case 0x47: return lfn_current_dir(r);
+	case 0x4e: return lfn_find_first(r);
+	case 0x4f: {
+		const auto it = lfn_searches.find(r.bx);
+		if (r.si != 1) {
+			return lfn_fail(r, DOSERR_FUNCTION_NUMBER_INVALID);
+		}
+		if (it == lfn_searches.end()) {
+			return lfn_fail(r, DOSERR_INVALID_HANDLE);
+		}
+		return lfn_find_out(r, it->second);
+	}
+	case 0xa1:
+		if (!lfn_searches.erase(r.bx)) {
+			return lfn_fail(r, DOSERR_INVALID_HANDLE);
+		}
+		r.ok();
+		return Outcome::Handled;
+	case 0x56: return lfn_rename(r);
+	case 0x60: return lfn_full_path(r);
+	case 0x6c: return lfn_create_open(r);
+	case 0xa0: return lfn_volume_info(r);
+	default:
+		// As MS-DOS 7: AX = 7100h. The guest takes the extended error.
+		lfn_fail(r, DOSERR_FUNCTION_NUMBER_INVALID);
+		r.ax = 0x7100;
+		return Outcome::Handled;
+	}
+}
+
+std::string lfn_long_dir(const uint8_t drive, const std::string& short_dir)
+{
+	LfnDir d;
+	if (!lfn_root(drive, d)) {
+		return short_dir;
+	}
+	for (const auto& c : split_short(short_dir)) {
+		lfn_list(d);
+		const HostLfn::Entry* e = HostLfn::find_entry(d.entries, c);
+		if (!e || !e->is_dir) {
+			return short_dir;
+		}
+		const HostLfn::Entry copy = *e;
+		lfn_descend(d, copy);
+	}
+	return join_comps(d.long_comps);
+}
+
+std::unordered_map<std::string, std::string> lfn_long_names(localDrive& ld,
+                                                            const std::string& host_dir,
+                                                            const std::string& cache_dir)
+{
+	std::unordered_map<std::string, std::string> names;
+	for (const auto& e : HostLfn::list_dir(HostLfn::from_native(host_dir),
+	                                       lfn_short_names(ld, cache_dir))) {
+		names[e.native_name] = e.geos_name;
+	}
+	return names;
 }
 
 } // namespace
@@ -835,6 +1711,12 @@ static Outcome execute_int21(Regs& r)
 		return Outcome::Handled;
 	}
 
+	case 0x71: // long file names, only if granted (bit 71h in the map)
+		if (!fs_lfn) {
+			return Outcome::NotHandled;
+		}
+		return execute_lfn(r);
+
 	default: return Outcome::NotHandled;
 	}
 }
@@ -905,6 +1787,11 @@ static void cmd_enable(const uint16_t cmd[6], uint16_t resp[6])
 	for (const auto fn : HandledFunctions) {
 		bits[fn >> 3] |= static_cast<uint8_t>(1u << (fn & 7));
 	}
+	fs_lfn = (options & HIF_FS_OPT_LFN) != 0;
+	if (fs_lfn) {
+		bits[HOST_FS_LFN_FUNCTION >> 3] |= static_cast<uint8_t>(1u << (HOST_FS_LFN_FUNCTION & 7));
+	}
+	lfn_reset();
 	MEM_BlockWrite(map, bits, FuncMapBytes);
 
 	fs_enabled       = true;
@@ -919,9 +1806,10 @@ static void cmd_enable(const uint16_t cmd[6], uint16_t resp[6])
 	resp[1] = HIF_FS_MAGIC;
 	resp[2] = HIF_API_FS_VERSION;
 	resp[3] = drive_generation;
-	LOG_INFO("GEOSHOST: FS fast path enabled (psp=%04x, %s mode)",
+	LOG_INFO("GEOSHOST: FS fast path enabled (psp=%04x, %s mode%s)",
 	         psp_seg,
-	         selector_mode() ? "protected" : "real");
+	         selector_mode() ? "protected" : "real",
+	         fs_lfn ? ", long file names" : "");
 }
 
 static void cmd_int21(const uint16_t cmd[6], uint16_t resp[6])
@@ -995,6 +1883,7 @@ static void cmd_drive_info(const uint16_t cmd[6], uint16_t resp[6])
 	if (d.IsRemovable()) flags |= HFDF_REMOVABLE;
 	if (d.IsRemote()) flags |= HFDF_REMOTE;
 	if (drive == DOS_GetDefaultDrive()) flags |= HFDF_DEFAULT;
+	if (fs_lfn && local_drive(static_cast<uint8_t>(drive))) flags |= HFDF_LFN;
 
 	uint16_t bytes_sector    = 512;
 	uint8_t sectors_cluster  = 0;

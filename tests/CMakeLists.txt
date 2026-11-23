@@ -14,6 +14,7 @@ add_executable(dosbox_tests
     fraction_tests.cpp
     fs_utils_tests.cpp
     i8042_wide_read_tests.cpp
+    hostfs_lfn_tests.cpp
     hostfs_volume_tests.cpp
     image_decoder_tests.cpp
     int10_modes_tests.cpp

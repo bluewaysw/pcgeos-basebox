@@ -3,6 +3,7 @@ target_sources(libdosboxcommon PRIVATE
   geoshost_fs.cpp
   geoshost_mem.cpp
   geoshost_hostfs.cpp
+  hostfs_lfn.cpp
   hostfs_volume.cpp
   tlse.c
   SDL3_net/SDL_net.c

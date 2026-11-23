@@ -13,6 +13,7 @@
 #include <ctime>
 #include <set>
 #include <system_error>
+#include <utility>
 
 namespace HostFs {
 
@@ -33,6 +34,123 @@ constexpr size_t GFH_password  = 204; // 8
 constexpr size_t GFH_desktop   = 212; // 16
 
 constexpr char DirNameFile[] = "@DIRNAME.000";
+
+/* ----------------------------------------------------------------
+ * GEOS character set <-> Unicode
+ *
+ * The GEOS SBCS character set (Include/char.def) is mapped to Unicode
+ * by gen_geos_charset.py, which checks the table against the names in
+ * char.def. Host names are UTF-8; GEOS names are GEOS characters.
+ * ---------------------------------------------------------------- */
+
+#include "geos_charset.inc"
+
+/** GEOS character for a Unicode code point >= 0x80, or -1. */
+int unicode_to_geos(const char32_t cp)
+{
+	for (size_t i = 0; i < 128; ++i) {
+		if (GeosToUnicode[i] != 0 && GeosToUnicode[i] == cp) {
+			return static_cast<int>(0x80 + i);
+		}
+	}
+	return -1;
+}
+
+char32_t compose(const char32_t base, const char32_t mark)
+{
+	for (const auto& c : GeosCompositions) {
+		if (c.base == base && c.mark == mark) {
+			return c.composed;
+		}
+	}
+	return 0;
+}
+
+bool is_combining(const char32_t cp)
+{
+	return (cp >= 0x0300 && cp <= 0x036F) || (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+	       (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF) ||
+	       (cp >= 0xFE20 && cp <= 0xFE2F);
+}
+
+/** Next code point of UTF-8 text; invalid bytes come back as U+FFFD. */
+char32_t next_utf8(const std::string& s, size_t& i)
+{
+	const auto b0 = static_cast<unsigned char>(s[i]);
+	size_t n      = 0;
+	char32_t cp   = 0;
+	if (b0 < 0x80) {
+		++i;
+		return b0;
+	} else if ((b0 & 0xE0) == 0xC0) {
+		n  = 1;
+		cp = b0 & 0x1F;
+	} else if ((b0 & 0xF0) == 0xE0) {
+		n  = 2;
+		cp = b0 & 0x0F;
+	} else if ((b0 & 0xF8) == 0xF0) {
+		n  = 3;
+		cp = b0 & 0x07;
+	} else {
+		++i;
+		return 0xFFFD;
+	}
+	if (i + n >= s.size()) { // truncated sequence
+		++i;
+		return 0xFFFD;
+	}
+	for (size_t k = 1; k <= n; ++k) {
+		const auto b = static_cast<unsigned char>(s[i + k]);
+		if ((b & 0xC0) != 0x80) {
+			++i;
+			return 0xFFFD;
+		}
+		cp = (cp << 6) | (b & 0x3F);
+	}
+	i += n + 1;
+	return cp;
+}
+
+void append_utf8(std::string& out, const char32_t cp)
+{
+	if (cp < 0x80) {
+		out.push_back(static_cast<char>(cp));
+	} else if (cp < 0x800) {
+		out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+		out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+	} else if (cp < 0x10000) {
+		out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+		out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+		out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+	} else {
+		out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+		out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+		out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+		out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+	}
+}
+
+uint8_t geos_upper(const uint8_t c)
+{
+	if (c < 0x80) {
+		return static_cast<uint8_t>(std::toupper(c));
+	}
+	for (const auto& p : GeosUpperCase) {
+		if (p.first == c) {
+			return p.second;
+		}
+	}
+	return c;
+}
+
+/** GEOS name in upper case, for case-insensitive sets of GEOS names. */
+std::string geos_upper(std::string s)
+{
+	for (auto& c : s) {
+		c = static_cast<char>(geos_upper(static_cast<uint8_t>(c)));
+	}
+	return s;
+}
 
 uint16_t get16(const uint8_t* p)
 {
@@ -95,6 +213,13 @@ bool is_dos_char(const char c)
 std::string utf8_name(const fs::path& p)
 {
 	const auto u8 = p.filename().u8string();
+	return std::string(u8.begin(), u8.end());
+}
+
+/** Cache key of a host path. Unlike string(), never throws on Windows. */
+std::string path_key(const fs::path& p)
+{
+	const auto u8 = p.u8string();
 	return std::string(u8.begin(), u8.end());
 }
 
@@ -221,8 +346,11 @@ std::string join_rel(const std::string& parent, const std::string& name)
 }
 
 /** GEOS names reachable through the GEOS path syntax only. */
-std::string geos_long_name(const Item& it)
+std::string geos_long_name(const Item& it, bool* lossy = nullptr)
 {
+	if (lossy) {
+		*lossy = false;
+	}
 	if (it.has_header) {
 		const char* n = reinterpret_cast<const char*>(it.header + GFH_longName);
 		const std::string s(n, strnlen(n, LongNameLength));
@@ -230,7 +358,7 @@ std::string geos_long_name(const Item& it)
 			return s;
 		}
 	}
-	return decode_host_name(it.host_name);
+	return decode_host_name(it.host_name, lossy);
 }
 
 } // namespace
@@ -239,7 +367,26 @@ std::string geos_long_name(const Item& it)
  * Helpers
  * ---------------------------------------------------------------- */
 
-std::string decode_host_name(const std::string& host_name)
+void dos_date_time(const fs::file_time_type ft, uint16_t& date, uint16_t& time)
+{
+	to_date_time(ft, date, time);
+}
+
+bool geos_iequals(std::string_view a, std::string_view b)
+{
+	if (a.size() != b.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < a.size(); ++i) {
+		if (geos_upper(static_cast<uint8_t>(a[i])) !=
+		    geos_upper(static_cast<uint8_t>(b[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::string decode_host_name(const std::string& host_name, bool* lossy)
 {
 	auto hex = [](const char c) -> int {
 		if (c >= '0' && c <= '9') return c - '0';
@@ -247,11 +394,13 @@ std::string decode_host_name(const std::string& host_name)
 		if (c >= 'a' && c <= 'f') return c - 'a' + 10;
 		return -1;
 	};
+	bool lost = false;
 	std::string out;
 	for (size_t i = 0; i < host_name.size();) {
 		const auto c = static_cast<unsigned char>(host_name[i]);
 		if (c == '%' && i + 2 < host_name.size() && hex(host_name[i + 1]) >= 0 &&
 		    hex(host_name[i + 2]) >= 0) {
+			// a GEOS character byte (also names written by older versions)
 			const auto b = static_cast<char>(hex(host_name[i + 1]) * 16 +
 			                                 hex(host_name[i + 2]));
 			// a path separator can't be part of a GEOS name
@@ -259,18 +408,40 @@ std::string decode_host_name(const std::string& host_name)
 			i += 3;
 			continue;
 		}
-		if (c >= 0x80) {
-			// Unicode beyond ASCII: no GEOS mapping yet
+		if (c < 0x20) {
 			out.push_back('_');
+			lost = true;
 			++i;
-			while (i < host_name.size() &&
-			       (static_cast<unsigned char>(host_name[i]) & 0xc0) == 0x80) {
-				++i;
-			}
 			continue;
 		}
-		out.push_back(c < 0x20 ? '_' : static_cast<char>(c));
-		++i;
+		char32_t cp = next_utf8(host_name, i);
+		// Decomposed forms (macOS stores names that way): base + mark
+		if (i < host_name.size()) {
+			size_t j            = i;
+			const char32_t mark = next_utf8(host_name, j);
+			if (is_combining(mark)) {
+				if (const char32_t composed = compose(cp, mark)) {
+					cp = composed;
+					i  = j;
+				}
+			}
+		}
+		if (cp < 0x80) {
+			out.push_back(static_cast<char>(cp));
+			continue;
+		}
+		const int g = is_combining(cp) ? -1 : unicode_to_geos(cp);
+		if (g >= 0) {
+			out.push_back(static_cast<char>(g));
+		} else {
+			// No GEOS equivalent: a placeholder, and the caller makes
+			// the name unique with a hash (see assign_names)
+			out.push_back('_');
+			lost = true;
+		}
+	}
+	if (lossy) {
+		*lossy = lost;
 	}
 	return out;
 }
@@ -282,7 +453,8 @@ std::string encode_geos_name(std::string_view geos_name)
 	for (size_t i = 0; i < geos_name.size(); ++i) {
 		const auto c = static_cast<unsigned char>(geos_name[i]);
 		const bool last = i + 1 == geos_name.size();
-		const bool escape = c < 0x20 || c >= 0x7f ||
+		const char32_t u = c >= 0x80 ? GeosToUnicode[c - 0x80] : 0;
+		const bool escape = c < 0x20 || c == 0x7f || (c >= 0x80 && u == 0) ||
 		                    std::strchr("\\/:*?\"<>|%", c) != nullptr ||
 		                    (i == 0 && c == '.') || // would be hidden
 		                    (last && (c == '.' || c == ' ')); // Windows
@@ -290,6 +462,8 @@ std::string encode_geos_name(std::string_view geos_name)
 			out.push_back('%');
 			out.push_back(hexdig[c >> 4]);
 			out.push_back(hexdig[c & 0xf]);
+		} else if (c >= 0x80) {
+			append_utf8(out, u);
 		} else {
 			out.push_back(static_cast<char>(c));
 		}
@@ -597,14 +771,17 @@ void assign_names(std::vector<Item>& items)
 	// items are sorted by host name, so "sorts later" is "comes later"
 	std::set<std::string> longs, doses;
 	for (auto& item : items) {
-		const std::string natural = geos_long_name(item);
-		std::string ln = natural.size() <= LongNameLength
+		bool lossy = false;
+		const std::string natural = geos_long_name(item, &lossy);
+		// Names that lost characters GEOS can't show get the hash too,
+		// so they stay unique and resolvable
+		std::string ln = natural.size() <= LongNameLength && !lossy
 		                       ? natural
 		                       : shortened_long_name(natural, item.host_name, 0);
-		for (int salt = 1; longs.count(upper(ln)) && salt < 1000; ++salt) {
+		for (int salt = 1; longs.count(geos_upper(ln)) && salt < 1000; ++salt) {
 			ln = shortened_long_name(natural, item.host_name, salt);
 		}
-		longs.insert(upper(ln));
+		longs.insert(geos_upper(ln));
 		std::memset(item.long_name, 0, sizeof(item.long_name));
 		std::memcpy(item.long_name, ln.data(), ln.size());
 
@@ -632,7 +809,7 @@ const Volume::Listing* Volume::get_listing(const fs::path& dir, const std::strin
 	std::error_code tec0;
 	const auto dir_mtime = fs::last_write_time(dir, tec0);
 	if (!fresh && !tec0) {
-		const auto cached = listings_.find(dir.string());
+		const auto cached = listings_.find(path_key(dir));
 		if (cached != listings_.end() && cached->second->dir_mtime == dir_mtime &&
 		    now - cached->second->built < std::chrono::milliseconds(ListingMaxAgeMs)) {
 			err = OK;
@@ -652,7 +829,8 @@ const Volume::Listing* Volume::get_listing(const fs::path& dir, const std::strin
 		err = ERROR_PATH_NOT_FOUND;
 		return nullptr;
 	}
-	for (const auto& e : it) {
+	for (const fs::directory_iterator end; !ec && it != end; it.increment(ec)) {
+		const auto& e = *it;
 		Item item;
 		item.host      = e.path();
 		item.host_name = utf8_name(e.path());
@@ -715,7 +893,7 @@ const Volume::Listing* Volume::get_listing(const fs::path& dir, const std::strin
 	if (record_watch) {
 		watch(dir, rel, listing->items);
 	}
-	auto& slot = listings_[dir.string()];
+	auto& slot = listings_[path_key(dir)];
 	slot = std::move(listing);
 	return slot.get();
 }
@@ -724,7 +902,7 @@ bool Volume::cached_header(const fs::path& file, const uintmax_t size,
                            const fs::file_time_type mtime, uint8_t (&header)[HeaderSize],
                            uint16_t* geode_attrs)
 {
-	const std::string key = file.string();
+	const std::string key = path_key(file);
 	auto it = header_cache_.find(key);
 	if (it == header_cache_.end() || it->second.size != size || it->second.mtime != mtime) {
 		if (header_cache_.size() >= MaxCachedHeaders) {
@@ -779,10 +957,10 @@ void Volume::refresh_item(Item& item)
 
 void Volume::invalidate(const fs::path& dir)
 {
-	listings_.erase(dir.string());
+	listings_.erase(path_key(dir));
 	// GEOS changed this directory itself (and notifies about that): take
 	// the new state as known, so poll() doesn't report it again.
-	const auto it = watches_.find(dir.string());
+	const auto it = watches_.find(path_key(dir));
 	if (it != watches_.end()) {
 		Error err = OK;
 		const std::string rel = it->second->rel;
@@ -793,7 +971,7 @@ void Volume::invalidate(const fs::path& dir)
 
 void Volume::watch(const fs::path& dir, const std::string& rel, const std::vector<Item>& items)
 {
-	const std::string key = dir.string();
+	const std::string key = path_key(dir);
 	auto it = watches_.find(key);
 	if (it != watches_.end()) {
 		it->second->used = ++watch_clock_; // known: poll() keeps it current
@@ -994,7 +1172,7 @@ Error Volume::lookup(const uint32_t base_id, std::string_view path, Lookup& out,
 		const bool is_dos = (!final || final_alias) && to_dos_name(comps[i], dos);
 		const Item* found = nullptr;
 		for (const auto& it : l->items) {
-			if (iequals(it.long_name, comps[i]) || it.host_name == comps[i] ||
+			if (geos_iequals(it.long_name, comps[i]) || it.host_name == comps[i] ||
 			    (is_dos && std::memcmp(it.dos_name, dos, DosNameLength) == 0)) {
 				found = &it;
 				break;
@@ -1036,7 +1214,7 @@ Error Volume::make_host_name(const fs::path& parent, const std::string& parent_r
 	}
 	host_name = encode_geos_name(geos_name);
 	for (const auto& it : l->items) {
-		if (iequals(it.long_name, geos_name) || iequals(it.host_name, host_name)) {
+		if (geos_iequals(it.long_name, geos_name) || iequals(it.host_name, host_name)) {
 			return ERROR_FILE_EXISTS;
 		}
 	}
@@ -1283,8 +1461,9 @@ Error Volume::remove_dir(const uint32_t base_id, std::string_view path, uint32_t
 		return ERROR_ACCESS_DENIED;
 	}
 	std::error_code ec;
-	for (const auto& e : fs::directory_iterator(lk.item.host, ec)) {
-		if (!iequals(utf8_name(e.path()), DirNameFile)) {
+	fs::directory_iterator dit(lk.item.host, ec);
+	for (const fs::directory_iterator end; !ec && dit != end; dit.increment(ec)) {
+		if (!iequals(utf8_name(dit->path()), DirNameFile)) {
 			return ERROR_DIRECTORY_NOT_EMPTY;
 		}
 	}
@@ -1341,14 +1520,14 @@ Error Volume::rename(const uint32_t base_id, std::string_view path,
 	if (!lk.item.is_dir && is_open(lk.item.host)) {
 		return ERROR_FILE_IN_USE;
 	}
-	if (iequals(lk.item.long_name, new_name) && !lk.item.has_header &&
+	if (geos_iequals(lk.item.long_name, new_name) && !lk.item.has_header &&
 	    decode_host_name(lk.item.host_name) == new_name) {
 		renamed = lk.item;
 		return OK;
 	}
 	std::string host_name;
 	Error e = make_host_name(lk.parent, lk.parent_rel, new_name, host_name);
-	if (e == ERROR_FILE_EXISTS && iequals(lk.item.long_name, new_name)) {
+	if (e == ERROR_FILE_EXISTS && geos_iequals(lk.item.long_name, new_name)) {
 		e = OK; // only the case changes
 		host_name = encode_geos_name(new_name);
 	}
@@ -1418,7 +1597,7 @@ Error Volume::move(const uint32_t base_id, std::string_view path,
 	invalidate(dst.parent);
 	Item m = src.item;
 	m.host = target;
-	if (m.has_header && !iequals(m.long_name, dst.last)) {
+	if (m.has_header && !geos_iequals(m.long_name, dst.last)) {
 		uint8_t name[36] = {};
 		std::memcpy(name, dst.last.data(), std::min<size_t>(dst.last.size(), 32));
 		update_header_field(m, GFH_longName, name, sizeof(name));

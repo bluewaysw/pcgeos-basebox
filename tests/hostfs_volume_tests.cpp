@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -131,8 +132,97 @@ TEST(HostFsNames, EncodeDecodeRoundTrip)
 		EXPECT_NE(host.front(), '.');
 	}
 	EXPECT_EQ(encode_geos_name("Plain Name"), "Plain Name");
-	EXPECT_EQ(decode_host_name("Gr\xc3\xbc\xc3\x9f" "e"), "Gr__e");
+	// UTF-8 host name -> GEOS characters (u-umlaut 0x9F, sharp s 0xA7)
+	EXPECT_EQ(decode_host_name("Gr\xc3\xbc\xc3\x9f" "e"), "Gr\x9F\xA7" "e");
 	EXPECT_EQ(decode_host_name("50%.txt"), "50%.txt"); // not an escape
+}
+
+TEST(HostFsNames, GeosCharactersAreStoredAsUnicode)
+{
+	// Every GEOS character with a Unicode equivalent is written as UTF-8,
+	// not escaped, and comes back unchanged
+	for (int c = 0x80; c <= 0xFF; ++c) {
+		const std::string n = std::string("x") + static_cast<char>(c) + "y";
+		const auto host     = encode_geos_name(n);
+		EXPECT_EQ(decode_host_name(host), n) << std::hex << c;
+		if (c == 0xF0) {
+			EXPECT_EQ(host, "x%F0y"); // GEOS logo: no Unicode equivalent
+		} else {
+			EXPECT_EQ(host.find('%'), std::string::npos) << std::hex << c;
+		}
+	}
+	EXPECT_EQ(encode_geos_name("Gr\x9F\xA7" "e"), "Gr\xc3\xbc\xc3\x9f" "e");
+	EXPECT_EQ(encode_geos_name("\x7F"), "%7F"); // DEL stays escaped
+}
+
+TEST(HostFsNames, DecomposedAndOldNames)
+{
+	bool lossy = true;
+	// macOS style: u + combining diaeresis
+	EXPECT_EQ(decode_host_name("Gru\xcc\x88\xc3\x9f" "e", &lossy), "Gr\x9F\xA7" "e");
+	EXPECT_FALSE(lossy);
+	// written by an older version: every non-ASCII character escaped
+	EXPECT_EQ(decode_host_name("Gr%9F%A7e", &lossy), "Gr\x9F\xA7" "e");
+	EXPECT_FALSE(lossy);
+}
+
+TEST(HostFsNames, UnmappableCharacters)
+{
+	bool lossy = false;
+	// U+1F600 (emoji) and U+0416 (Cyrillic) have no GEOS equivalent
+	EXPECT_EQ(decode_host_name("a\xf0\x9f\x98\x80" "b", &lossy), "a_b");
+	EXPECT_TRUE(lossy);
+	EXPECT_EQ(decode_host_name("\xd0\x96", &lossy), "_");
+	EXPECT_TRUE(lossy);
+	EXPECT_EQ(decode_host_name("a\xff" "b", &lossy), "a_b"); // invalid UTF-8
+	EXPECT_TRUE(lossy);
+	EXPECT_EQ(decode_host_name("plain", &lossy), "plain");
+	EXPECT_FALSE(lossy);
+}
+
+TEST(HostFsNames, GeosCaseInsensitive)
+{
+	EXPECT_TRUE(geos_iequals("Gr\x9A\xA7" "e", "GR\x85\xA7" "E")); // o-umlaut
+	EXPECT_TRUE(geos_iequals("\x8E", "\x83"));                       // e-acute
+	EXPECT_TRUE(geos_iequals("\xD8", "\xD9"));                       // y-umlaut
+	EXPECT_FALSE(geos_iequals("\xB6", "\xC6")); // partial diff. vs Delta
+	EXPECT_FALSE(geos_iequals("ab", "abc"));
+}
+
+TEST_F(HostFsTest, UnicodeHostNames)
+{
+	// A host name GEOS can show fully keeps its name
+	write_text(root_ / fs::path(u8"Gr\u00FC\u00DFe.txt"), "a");
+	EXPECT_TRUE(exists("\\Gr\x9F\xA7" "e.txt"));
+	EXPECT_TRUE(exists("\\GR\x86\xA7" "E.TXT")); // GEOS case folding
+
+	// Names that lose characters get a hash and stay distinct
+	write_text(root_ / fs::path(u8"Note \U0001F600.txt"), "b");
+	write_text(root_ / fs::path(u8"Note \U0001F601.txt"), "c");
+	std::vector<Item> items;
+	ASSERT_EQ(vol_->list(root_id_, items), OK);
+	std::set<std::string> names;
+	for (const auto& i : items) {
+		const std::string ln(i.long_name);
+		if (ln.rfind("Note _", 0) == 0) {
+			EXPECT_NE(ln.find('~'), std::string::npos) << ln;
+			EXPECT_EQ(ln.substr(ln.size() - 4), ".txt");
+			names.insert(ln);
+		}
+	}
+	EXPECT_EQ(names.size(), 2u);
+	for (const auto& n : names) {
+		EXPECT_TRUE(exists("\\" + n)) << n;
+	}
+
+	// Files GEOS creates with GEOS characters get readable host names
+	uint16_t h = 0;
+	Item it;
+	ASSERT_EQ(vol_->create(root_id_, "\\Caf\x8E.txt", 0, FCF_NATIVE, 2, h, it), OK);
+	bool closed = false, dirty = false;
+	uint32_t id = 0;
+	vol_->close(h, closed, dirty, id);
+	EXPECT_TRUE(fs::exists(root_ / fs::path(u8"Caf\u00E9.txt")));
 }
 
 TEST(HostFsNames, StableIds)
@@ -615,4 +705,21 @@ TEST_F(HostFsTest, HeadersAreReadOnceUntilFilesChange)
 	write_text(root_ / "tiny.txt", "x");
 	ASSERT_EQ(vol_->list(root_id_, items), OK);
 	EXPECT_EQ(vol_->header_reads(), before_small + 1); // counted, not opened
+}
+
+TEST_F(HostFsTest, OddHostNamesDontThrow)
+{
+	write_text(root_ / std::string("odd\xfe" "name.txt"), "x");
+	fs::create_directories(root_ / std::string("odd\xfd" "dir"));
+	std::vector<Item> items;
+	ASSERT_NO_THROW(EXPECT_EQ(vol_->list(root_id_, items), OK));
+	int seen = 0;
+	for (const auto& i : items) {
+		if (i.host_name.rfind("odd", 0) == 0) {
+			++seen;
+			EXPECT_TRUE(exists("\\" + std::string(i.long_name)));
+		}
+	}
+	EXPECT_EQ(seen, 2);
+	ASSERT_NO_THROW(vol_->poll()); // the watcher sees them too
 }
