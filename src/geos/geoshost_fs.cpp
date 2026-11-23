@@ -30,8 +30,10 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <map>
 #include <memory>
 #include <unordered_map>

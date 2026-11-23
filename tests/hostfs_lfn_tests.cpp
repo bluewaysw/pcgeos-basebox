@@ -9,11 +9,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
 #include <random>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace HostLfn;
